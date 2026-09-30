@@ -3,8 +3,8 @@
 One keyboard and mouse for two computers on the same local network. Push the pointer through the
 edge of the screen, or double-tap Right Ctrl, and it carries on onto the other machine.
 
-Status: Linux (X11) drives a Windows PC. Windows driving Linux, the clipboard, pairing and a tray
-icon come next.
+Status: Linux (X11) and Windows drive each other. The clipboard, pairing and a tray icon come
+next.
 
 ## Setup
 

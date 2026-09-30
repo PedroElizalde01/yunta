@@ -228,7 +228,8 @@ impl Core {
                 }
                 _ => {}
             },
-            Event::Key { hid, down } => {
+            // While driven, what arrives here includes the keys we inject for the peer.
+            Event::Key { hid, down } if self.state != State::Driven => {
                 if self.state == State::Driving {
                     self.forward(Msg::Key { hid, down });
                 }
@@ -295,11 +296,12 @@ impl Core {
     }
 
     fn drive(&mut self, pos: u16) {
+        // Before the grab, which parks the cursor on Windows.
+        self.exit = self.os.cursor();
         if !self.os.grab(true) {
             eprintln!("could not take the keyboard and mouse: another app is holding them");
             return;
         }
-        self.exit = self.os.cursor();
         self.state = State::Driving;
         self.send(Msg::Enter { edge: self.cfg.edge.opposite(), pos });
     }

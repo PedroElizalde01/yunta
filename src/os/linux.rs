@@ -3,7 +3,9 @@
 //!
 //! The grab lives on a second X connection: the server sends no raw events to the client that
 //! holds the grab, and raw motion is what still moves when the hidden pointer sits at an edge.
+//! XTest plays the peer's input.
 
+use std::cell::Cell;
 use std::io;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, mpsc};
@@ -14,6 +16,7 @@ use x11rb::protocol::randr::ConnectionExt as _;
 use x11rb::protocol::xinput::{self, ConnectionExt as _};
 use x11rb::protocol::xkb::{self, ConnectionExt as _};
 use x11rb::protocol::xproto::{self, ConnectionExt as _, GrabMode, GrabStatus};
+use x11rb::protocol::xtest::ConnectionExt as _;
 use x11rb::rust_connection::RustConnection;
 use x11rb::{CURRENT_TIME, NONE};
 
@@ -28,6 +31,8 @@ pub struct Os {
     root: u32,
     blank: u32,
     grabbed: Arc<AtomicBool>,
+    /// Scrolling not yet a whole wheel notch, since X only knows notches.
+    scroll: Cell<(i32, i32)>,
 }
 
 impl Os {
@@ -40,6 +45,7 @@ impl Os {
         let mask = xinput::XIEventMask::RAW_MOTION | xinput::XIEventMask::RAW_KEY_PRESS | xinput::XIEventMask::RAW_KEY_RELEASE;
         conn.xinput_xi_select_events(root, &[xinput::EventMask { deviceid: xinput::Device::ALL_MASTER.into(), mask: vec![mask] }])
             .map_err(other)?;
+        conn.xtest_get_version(2, 2).map_err(other)?.reply().map_err(|_| io::Error::other("the X server has no XTest"))?;
         conn.flush().map_err(other)?;
 
         let (grab_conn, _) = x11rb::connect(None).map_err(other)?;
@@ -55,7 +61,8 @@ impl Os {
         let blank = blank_cursor(&grab_conn, root)?;
         grab_conn.flush().map_err(other)?;
 
-        let os = Os { conn: conn.clone(), grab_conn: grab_conn.clone(), screen, root, blank, grabbed: Arc::default() };
+        let os =
+            Os { conn: conn.clone(), grab_conn: grab_conn.clone(), screen, root, blank, grabbed: Arc::default(), scroll: Cell::default() };
         let grabbed = os.grabbed.clone();
         let tx2 = tx.clone();
         std::thread::spawn(move || capture(conn, root, grabbed, tx));
@@ -107,8 +114,44 @@ impl Os {
         false
     }
 
-    // ponytail: injection (XTest) lands with A3, until then this machine only drives
-    pub fn inject(&self, _msg: &Msg) {}
+    pub fn inject(&self, msg: &Msg) {
+        match *msg {
+            Msg::Key { hid, down } => {
+                let Some(code) = keymap::evdev_from_hid(hid) else { return };
+                self.fake(if down { xproto::KEY_PRESS_EVENT } else { xproto::KEY_RELEASE_EVENT }, (code + 8) as u8);
+            }
+            Msg::Button { button, down } => {
+                let Some(&detail) = [1, 3, 2, 8, 9].get(usize::from(button).wrapping_sub(1)) else { return };
+                self.fake(if down { xproto::BUTTON_PRESS_EVENT } else { xproto::BUTTON_RELEASE_EVENT }, detail);
+            }
+            Msg::Scroll { dx, dy } => {
+                let (mut sx, mut sy) = self.scroll.get();
+                // Up is button 4 and down 5; left is 6 and right 7.
+                for (clicks, up, down) in [(notches(&mut sy, dy), 4, 5), (notches(&mut sx, dx), 7, 6)] {
+                    for _ in 0..clicks.abs() {
+                        let b = if clicks > 0 { up } else { down };
+                        self.fake(xproto::BUTTON_PRESS_EVENT, b);
+                        self.fake(xproto::BUTTON_RELEASE_EVENT, b);
+                    }
+                }
+                self.scroll.set((sx, sy));
+            }
+            _ => return,
+        }
+        let _ = self.conn.flush();
+    }
+
+    fn fake(&self, kind: u8, detail: u8) {
+        let _ = self.conn.xtest_fake_input(kind, detail, CURRENT_TIME, NONE, 0, 0, 0);
+    }
+}
+
+/// Whole notches in `pending` + `delta` (120 each), keeping the remainder in `pending`.
+fn notches(pending: &mut i32, delta: i16) -> i32 {
+    *pending += i32::from(delta);
+    let whole = *pending / 120;
+    *pending -= whole * 120;
+    whole
 }
 
 /// Raw motion always, raw keys while not grabbed.
@@ -241,4 +284,17 @@ fn blank_cursor(conn: &RustConnection, root: u32) -> io::Result<u32> {
 
 fn other(e: impl std::error::Error + Send + Sync + 'static) -> io::Error {
     io::Error::other(e)
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn notches_carry_the_remainder() {
+        let mut pending = 0;
+        assert_eq!(super::notches(&mut pending, 40), 0);
+        assert_eq!(super::notches(&mut pending, 90), 1);
+        assert_eq!(pending, 10);
+        assert_eq!(super::notches(&mut pending, -250), -2);
+        assert_eq!(pending, 0);
+    }
 }

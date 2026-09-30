@@ -49,14 +49,12 @@ pub fn hid_from_evdev(code: u16) -> Option<u16> {
     KEYS.iter().find(|k| k.1 == code).map(|k| k.0)
 }
 
-// ponytail: unused until A3 injects on Linux
-#[allow(dead_code)]
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 pub fn evdev_from_hid(hid: u16) -> Option<u16> {
     KEYS.iter().find(|k| k.0 == hid).map(|k| k.1)
 }
 
-// ponytail: unused until A3 captures on Windows
-#[allow(dead_code)]
+#[cfg_attr(not(windows), allow(dead_code))]
 pub fn hid_from_scan(scan: u16) -> Option<u16> {
     KEYS.iter().find(|k| k.2 == scan).map(|k| k.0)
 }
