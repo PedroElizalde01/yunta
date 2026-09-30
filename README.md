@@ -3,8 +3,7 @@
 One keyboard and mouse for two computers on the same local network. Push the pointer through the
 edge of the screen, or double-tap Right Ctrl, and it carries on onto the other machine.
 
-Status: Linux (X11) and Windows drive each other. The clipboard, pairing and a tray icon come
-next.
+Text and images on the clipboard go along at every switch. Pairing and a tray icon come next.
 
 ## Setup
 
@@ -15,7 +14,9 @@ Until pairing lands, the two machines are introduced by hand:
 2. In each config, set `peer_key` to the other machine's public key.
 3. In the Linux config, set `peer` to the PC's address. The PC listens on TCP 24830: when Windows
    Firewall asks, allow it on private networks only.
-4. Run `yunta` on both. Linux's right-hand edge leads to the PC; change `edge` to move it.
+4. Set `edge` on each to the side the other machine is on: with the PC to the right of the Linux
+   machine, `edge = right` on Linux and `edge = left` on the PC.
+5. Run `yunta` on both.
 
 ## Build
 
@@ -37,6 +38,7 @@ seconds to finish. Nothing leaves the local network.
 
 ## Known limits
 
+- Files do not cross, only text up to 256KB and images up to 8MB as PNG.
 - X11 only on Linux. Wayland has no way for an app to watch or take over global input.
 - Windows ignores input sent into administrator windows (Task Manager, installers, UAC) unless
   yunta itself runs as administrator.

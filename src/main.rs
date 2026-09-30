@@ -1,3 +1,4 @@
+mod clip;
 mod config;
 mod crossing;
 mod keymap;
@@ -162,6 +163,7 @@ struct Core {
     /// Released on every switch and disconnect, so nothing stays stuck.
     held_there: Vec<Msg>,
     held_here: Vec<Msg>,
+    clip: Option<clip::Clip>,
 }
 
 impl Core {
@@ -181,6 +183,7 @@ impl Core {
             exit: (0, 0),
             held_there: vec![],
             held_here: vec![],
+            clip: clip::Clip::new(),
             cfg,
         }
     }
@@ -272,7 +275,10 @@ impl Core {
             }
             Msg::Leave { pos } => match self.state {
                 State::Driving => self.come_home(Some(pos)),
-                State::Driven => self.let_go(),
+                State::Driven => {
+                    self.let_go();
+                    self.send_clipboard();
+                }
                 State::Local => {}
             },
             Msg::Move { dx, dy } if self.state == State::Driven => {
@@ -283,6 +289,7 @@ impl Core {
                 let dragging = self.held_here.iter().any(|m| matches!(m, Msg::Button { .. }));
                 if let Push::Cross(pos) = self.back.motion(&self.displays, x, y, dx, dy, dragging) {
                     self.let_go();
+                    self.send_clipboard();
                     self.send(Msg::Leave { pos });
                 }
             }
@@ -290,7 +297,11 @@ impl Core {
                 track(&mut self.held_here, &msg);
                 self.os.inject(&msg);
             }
-            // ponytail: clipboard messages arrive from A4 on
+            Msg::ClipText(_) | Msg::ClipPng(_) => {
+                if let Some(clip) = &mut self.clip {
+                    clip.put(&msg);
+                }
+            }
             _ => {}
         }
     }
@@ -303,6 +314,7 @@ impl Core {
             return;
         }
         self.state = State::Driving;
+        self.send_clipboard();
         self.send(Msg::Enter { edge: self.cfg.edge.opposite(), pos });
     }
 
@@ -316,6 +328,13 @@ impl Core {
         let (x, y) = pos.and_then(|p| crossing::entry_point(&self.displays, self.cfg.edge, p)).unwrap_or(self.exit);
         self.os.move_to(x, y);
         self.state = State::Local;
+    }
+
+    /// Whichever machine gives input away sends its clipboard, ahead of the switch itself.
+    fn send_clipboard(&mut self) {
+        if let Some(msg) = self.clip.as_mut().and_then(clip::Clip::take) {
+            self.send(msg);
+        }
     }
 
     /// Stops being driven.
