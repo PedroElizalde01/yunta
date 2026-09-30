@@ -7,18 +7,37 @@ pub enum Msg {
     /// Keeps the link alive. Either side sends one when it has been quiet for a second.
     Ping,
     /// Raw relative pointer motion.
-    Move { dx: i16, dy: i16 },
+    Move {
+        dx: i16,
+        dy: i16,
+    },
     /// 1 left, 2 right, 3 middle, 4 back, 5 forward.
-    Button { button: u8, down: bool },
+    Button {
+        button: u8,
+        down: bool,
+    },
     /// 120 per wheel notch, as on Windows, so smooth scrolling fits between notches.
-    Scroll { dx: i16, dy: i16 },
+    /// Positive `dy` scrolls up (away from you), positive `dx` scrolls right.
+    Scroll {
+        dx: i16,
+        dy: i16,
+    },
     /// A USB HID keyboard usage (page 7), so every machine maps it to its own codes by position.
-    Key { hid: u16, down: bool },
+    Key {
+        hid: u16,
+        down: bool,
+    },
     /// Input moves to the receiver. The pointer appears on `edge` of its screens, `pos` of the
     /// way along (0 to 65535).
-    Enter { edge: Edge, pos: u16 },
-    /// The receiver's pointer went back out through the return edge, `pos` of the way along.
-    Leave { pos: u16 },
+    Enter {
+        edge: Edge,
+        pos: u16,
+    },
+    /// Input goes back to the machine that sent `Enter`. Either side can send it: the driven one
+    /// when its pointer goes back out through the edge it came in by, `pos` of the way along.
+    Leave {
+        pos: u16,
+    },
     ClipText(String),
     ClipPng(Vec<u8>),
 }

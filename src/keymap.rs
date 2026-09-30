@@ -3,6 +3,7 @@
 
 /// (HID usage, Linux evdev code, Windows set-1 scan code with 0xE0 prefix as 0xE0xx).
 /// X11 keycodes are evdev + 8. Power is left out on purpose: it must never cross.
+#[rustfmt::skip]
 const KEYS: &[(u16, u16, u16)] = &[
     (0x04, 30, 0x1E), (0x05, 48, 0x30), (0x06, 46, 0x2E), (0x07, 32, 0x20), // A B C D
     (0x08, 18, 0x12), (0x09, 33, 0x21), (0x0A, 34, 0x22), (0x0B, 35, 0x23), // E F G H
@@ -41,19 +42,26 @@ const KEYS: &[(u16, u16, u16)] = &[
     (0xE4, 97, 0xE01D), (0xE5, 54, 0x36), (0xE6, 100, 0xE038), (0xE7, 126, 0xE05C), // right-hand ones
 ];
 
+// Each platform uses its own half: evdev on Linux, scan codes on Windows.
 // ponytail: linear scans over ~120 rows per keystroke, a 256-entry lookup table if it ever shows up in a profile
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 pub fn hid_from_evdev(code: u16) -> Option<u16> {
     KEYS.iter().find(|k| k.1 == code).map(|k| k.0)
 }
 
+// ponytail: unused until A3 injects on Linux
+#[allow(dead_code)]
 pub fn evdev_from_hid(hid: u16) -> Option<u16> {
     KEYS.iter().find(|k| k.0 == hid).map(|k| k.1)
 }
 
+// ponytail: unused until A3 captures on Windows
+#[allow(dead_code)]
 pub fn hid_from_scan(scan: u16) -> Option<u16> {
     KEYS.iter().find(|k| k.2 == scan).map(|k| k.0)
 }
 
+#[cfg_attr(not(windows), allow(dead_code))]
 pub fn scan_from_hid(hid: u16) -> Option<u16> {
     KEYS.iter().find(|k| k.0 == hid).map(|k| k.2)
 }

@@ -113,7 +113,8 @@ pub fn entry_point(displays: &[Rect], edge: Edge, pos: u16) -> Option<(i32, i32)
     let v = start + ((pos as i64 * (len - 1) as i64 + 32767) / 65535) as i32;
     let (sx, sy) = edge.step();
     let d = displays.iter().min_by_key(|d| {
-        let (lo, n, depth) = if edge.vertical() { (d.y, d.h, d.x * sx + (d.w - 1) * sx.max(0)) } else { (d.x, d.w, d.y * sy + (d.h - 1) * sy.max(0)) };
+        let (lo, n, depth) =
+            if edge.vertical() { (d.y, d.h, d.x * sx + (d.w - 1) * sx.max(0)) } else { (d.x, d.w, d.y * sy + (d.h - 1) * sy.max(0)) };
         let gap = if v < lo { lo - v } else { (v - (lo + n - 1)).max(0) };
         (gap, -depth)
     })?;
@@ -123,6 +124,17 @@ pub fn entry_point(displays: &[Rect], edge: Edge, pos: u16) -> Option<(i32, i32)
         Edge::Top => (v.clamp(d.x, d.x + d.w - 1), d.y),
         Edge::Bottom => (v.clamp(d.x, d.x + d.w - 1), d.y + d.h - 1),
     })
+}
+
+/// Moves the pointer from (x, y) to (nx, ny), or as near as the displays allow.
+pub fn step_within(displays: &[Rect], x: i32, y: i32, nx: i32, ny: i32) -> (i32, i32) {
+    if displays.iter().any(|d| d.contains(nx, ny)) {
+        return (nx, ny);
+    }
+    match displays.iter().find(|d| d.contains(x, y)).or(displays.first()) {
+        Some(d) => (nx.clamp(d.x, d.x + d.w - 1), ny.clamp(d.y, d.y + d.h - 1)),
+        None => (x, y),
+    }
 }
 
 /// Start and length of all displays along `edge`.
@@ -218,6 +230,13 @@ mod tests {
         assert_eq!(entry_point(&[A, B], Edge::Right, pos_along(&[A, B], Edge::Right, 0, 500)), Some((3199, 500)));
         assert_eq!(entry_point(&[A, B], Edge::Right, 65535), Some((1919, 1079)));
         assert_eq!(entry_point(&[], Edge::Left, 0), None);
+    }
+
+    #[test]
+    fn steps_stay_on_screen() {
+        assert_eq!(step_within(&[A, B], 1900, 500, 1950, 510), (1950, 510)); // onto B
+        assert_eq!(step_within(&[A, B], 1900, 100, 1950, 110), (1919, 110)); // nothing beside A up here
+        assert_eq!(step_within(&[A], 10, 10, -5, -5), (0, 0));
     }
 
     #[test]
