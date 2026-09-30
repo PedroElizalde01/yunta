@@ -2,7 +2,7 @@
 
 use std::fs::{self, OpenOptions};
 use std::io::{self, Write};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use crate::crossing::Edge;
 use crate::link;
@@ -119,6 +119,32 @@ fn parse(path: PathBuf, text: &str) -> io::Result<Config> {
     Ok(cfg)
 }
 
+/// Rewrites one setting in the file, keeping everything else. `Some` replaces the setting, or its
+/// commented-out example, or adds it at the end; `None` removes it.
+pub fn set(path: &Path, key: &str, value: Option<&str>) -> io::Result<()> {
+    let text = fs::read_to_string(path)?;
+    let mut out = String::new();
+    let mut written = value.is_none();
+    for line in text.lines() {
+        let live = !line.trim_start().starts_with('#');
+        let name = line.trim_start_matches(['#', ' ']).split('=').next().unwrap_or("").trim();
+        if name == key && line.contains('=') && (live || !written) {
+            if let (Some(v), false) = (value, written) {
+                out.push_str(&format!("{key} = {v}\n"));
+                written = true;
+            }
+            continue;
+        }
+        out.push_str(line);
+        out.push('\n');
+    }
+    if !written && let Some(v) = value {
+        out.push_str(&format!("{key} = {v}\n"));
+    }
+    // Written in place, so the file keeps its owner-only permissions.
+    fs::write(path, out)
+}
+
 pub fn hex(bytes: &[u8]) -> String {
     bytes.iter().map(|b| format!("{b:02x}")).collect()
 }
@@ -148,5 +174,18 @@ mod tests {
             assert!(parse("t".into(), &format!("{text}{bad}\n")).is_err(), "{bad}");
         }
         assert!(parse("t".into(), "edge = left\n").is_err()); // no key
+    }
+
+    #[test]
+    fn set_rewrites_in_place() {
+        let path = std::env::temp_dir().join(format!("yunta-set-{}.conf", std::process::id()));
+        fs::write(&path, "# note = keep me\npeer_key =\n# peer = 1.2.3.4\nedge = left\n").unwrap();
+        set(&path, "peer_key", Some("ab")).unwrap();
+        set(&path, "peer", Some("10.0.0.9")).unwrap();
+        set(&path, "resistance", Some("0")).unwrap();
+        set(&path, "edge", None).unwrap();
+        let text = fs::read_to_string(&path).unwrap();
+        fs::remove_file(&path).unwrap();
+        assert_eq!(text, "# note = keep me\npeer_key = ab\npeer = 10.0.0.9\nresistance = 0\n");
     }
 }

@@ -4,6 +4,7 @@ mod crossing;
 mod keymap;
 mod link;
 mod msg;
+mod pair;
 
 #[cfg(target_os = "linux")]
 #[path = "os/linux.rs"]
@@ -62,8 +63,9 @@ fn main() {
         Some("init") => config::init().map(|cfg| {
             println!("config: {}\nthis machine's public key: {}", cfg.path.display(), config::hex(&cfg.public));
         }),
+        Some("pair") => pair(),
         Some(_) => {
-            eprintln!("usage: yunta [init]");
+            eprintln!("usage: yunta [init | pair]");
             std::process::exit(2);
         }
     };
@@ -71,6 +73,16 @@ fn main() {
         eprintln!("yunta: {e}");
         std::process::exit(1);
     }
+}
+
+/// Pairing mode, then the other machine's key (and, on the dialing side, its address) saved.
+fn pair() -> io::Result<()> {
+    let cfg = config::init()?;
+    let paired = pair::run(&cfg.public)?;
+    config::set(&cfg.path, "peer_key", Some(&config::hex(&paired.peer_key)))?;
+    config::set(&cfg.path, "peer", paired.dialer.then(|| paired.addr.to_string()).as_deref())?;
+    println!("\nPaired with {} ({}). Start `yunta` on both machines.", paired.name, paired.addr);
+    Ok(())
 }
 
 enum Role {

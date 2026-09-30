@@ -5,9 +5,12 @@ edition = "2024"
 
 [dependencies]
 arboard = { version = "3.6.1", default-features = false, features = ["image-data"] }
+chacha20poly1305 = "0.10"
+getrandom = "0.3"
 image = { version = "0.25.10", default-features = false, features = ["png"] }
 # Only the Noise_KK_25519_ChaChaPoly_BLAKE2s primitives. Not "std": in snow 0.10 it drags in ring.
 snow = { version = "0.10.0", default-features = false, features = ["default-resolver", "use-chacha20poly1305", "use-blake2", "use-curve25519", "use-getrandom"] }
+spake2 = "0.4.0"
 
 [profile.release]
 lto = true
