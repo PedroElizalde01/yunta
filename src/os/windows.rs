@@ -1,15 +1,17 @@
 //! Windows backend. Low-level hooks see keys, buttons and the wheel, and swallow all of it while
 //! this PC drives the peer. Raw Input measures how far the mouse moved: a hook reports the cursor
 //! already clamped to the desktop, so a push against the edge would never register there.
-//! SendInput plays the peer's input.
+//! SendInput plays the peer's input. The tray icon lives on the same thread and window.
 
 use std::ffi::c_void;
-use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
+use std::sync::Mutex;
+use std::sync::atomic::{AtomicBool, AtomicI32, AtomicPtr, Ordering};
 use std::sync::{OnceLock, mpsc};
 use std::{io, mem, ptr};
 
 use windows_sys::Win32::Foundation::{HWND, LPARAM, LRESULT, POINT, RECT, WPARAM};
 use windows_sys::Win32::Graphics::Gdi::{EnumDisplayMonitors, GetMonitorInfoW, HDC, HMONITOR, MONITORINFO};
+use windows_sys::Win32::System::Console::{ATTACH_PARENT_PROCESS, AllocConsole, AttachConsole, FreeConsole};
 use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows_sys::Win32::System::Threading::{GetCurrentThread, SetThreadPriority, THREAD_PRIORITY_HIGHEST};
 use windows_sys::Win32::UI::HiDpi::{DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2, SetProcessDpiAwarenessContext};
@@ -23,18 +25,22 @@ use windows_sys::Win32::UI::Input::{
     GetRawInputData, HRAWINPUT, MOUSE_MOVE_ABSOLUTE, RAWINPUT, RAWINPUTDEVICE, RAWINPUTHEADER, RID_INPUT, RIDEV_INPUTSINK, RIM_TYPEMOUSE,
     RegisterRawInputDevices,
 };
+use windows_sys::Win32::UI::Shell::{NIF_ICON, NIF_MESSAGE, NIF_TIP, NIM_ADD, NIM_DELETE, NIM_MODIFY, NOTIFYICONDATAW, Shell_NotifyIconW};
 use windows_sys::Win32::UI::WindowsAndMessaging::{
-    CallNextHookEx, CreateWindowExW, DefWindowProcW, DispatchMessageW, GetCursorPos, GetMessageW, GetSystemMetrics, HWND_MESSAGE,
-    KBDLLHOOKSTRUCT, LLKHF_EXTENDED, LLKHF_INJECTED, LLMHF_INJECTED, MSG, MSLLHOOKSTRUCT, RegisterClassW, SM_CXSCREEN, SM_CXVIRTUALSCREEN,
-    SM_CYSCREEN, SM_CYVIRTUALSCREEN, SM_XVIRTUALSCREEN, SM_YVIRTUALSCREEN, SetCursorPos, SetWindowsHookExW, WH_KEYBOARD_LL, WH_MOUSE_LL,
-    WM_INPUT, WM_KEYDOWN, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MBUTTONDOWN, WM_MBUTTONUP, WM_MOUSEHWHEEL, WM_MOUSEMOVE, WM_MOUSEWHEEL,
-    WM_RBUTTONDOWN, WM_RBUTTONUP, WM_SYSKEYDOWN, WM_XBUTTONDOWN, WM_XBUTTONUP, WNDCLASSW, XBUTTON1, XBUTTON2,
+    AppendMenuW, CallNextHookEx, CreateIcon, CreatePopupMenu, CreateWindowExW, DefWindowProcW, DestroyIcon, DestroyMenu, DispatchMessageW,
+    GetCursorPos, GetMessageW, GetSystemMetrics, HICON, KBDLLHOOKSTRUCT, LLKHF_EXTENDED, LLKHF_INJECTED, LLMHF_INJECTED, MF_CHECKED,
+    MF_GRAYED, MF_SEPARATOR, MF_STRING, MSG, MSLLHOOKSTRUCT, PostMessageW, RegisterClassW, SM_CXSCREEN, SM_CXVIRTUALSCREEN, SM_CYSCREEN,
+    SM_CYVIRTUALSCREEN, SM_XVIRTUALSCREEN, SM_YVIRTUALSCREEN, SetCursorPos, SetForegroundWindow, SetWindowsHookExW, TPM_NONOTIFY,
+    TPM_RETURNCMD, TPM_RIGHTBUTTON, TrackPopupMenu, WH_KEYBOARD_LL, WH_MOUSE_LL, WM_APP, WM_INPUT, WM_KEYDOWN, WM_LBUTTONDOWN,
+    WM_LBUTTONUP, WM_MBUTTONDOWN, WM_MBUTTONUP, WM_MOUSEHWHEEL, WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_RBUTTONDOWN, WM_RBUTTONUP, WM_SYSKEYDOWN,
+    WM_XBUTTONDOWN, WM_XBUTTONUP, WNDCLASSW, XBUTTON1, XBUTTON2,
 };
 use windows_sys::core::BOOL;
 
 use crate::crossing::Rect;
+use crate::icon::{self, Look};
 use crate::msg::Msg;
-use crate::{Event, Input, keymap};
+use crate::{Event, Input, autostart, keymap};
 
 /// Stamped on everything we inject. The hooks have a flag for injected input; Raw Input does not.
 const MARK: usize = 0x5955_4E54;
@@ -45,6 +51,44 @@ static GRABBED: AtomicBool = AtomicBool::new(false);
 /// While grabbed the cursor is parked here, and each swallowed move is measured from it. That
 /// keeps Windows' pointer acceleration, which Raw Input's counts do not have.
 static PARK: (AtomicI32, AtomicI32) = (AtomicI32::new(0), AtomicI32::new(0));
+static WINDOW: AtomicPtr<c_void> = AtomicPtr::new(ptr::null_mut());
+static TRAY: Mutex<(Look, String)> = Mutex::new((Look::Waiting, String::new()));
+
+const WM_TRAY_CLICK: u32 = WM_APP + 1;
+const WM_TRAY_SHOW: u32 = WM_APP + 2;
+
+/// Output goes to the terminal that started us, if any. Nothing appears otherwise.
+pub fn attach_console() {
+    unsafe { AttachConsole(ATTACH_PARENT_PROCESS) };
+}
+
+/// A console window of our own, for pairing: the app is built without one.
+pub fn open_console() -> bool {
+    unsafe { AllocConsole() != 0 }
+}
+
+pub fn close_console() {
+    unsafe { FreeConsole() };
+}
+
+/// The notification-area icon. Its menu is handled on the input thread.
+pub struct Tray;
+
+impl Tray {
+    pub fn start(_tx: mpsc::Sender<Input>) -> Option<Tray> {
+        Some(Tray)
+    }
+
+    pub fn show(&self, look: Look, status: &str) {
+        *TRAY.lock().unwrap() = (look, status.to_string());
+        unsafe { PostMessageW(WINDOW.load(Ordering::Relaxed), WM_TRAY_SHOW, 0, 0) };
+    }
+
+    pub fn remove(&self) {
+        let data = tray_data(WINDOW.load(Ordering::Relaxed));
+        unsafe { Shell_NotifyIconW(NIM_DELETE, &data) };
+    }
+}
 
 pub struct Os;
 
@@ -184,11 +228,13 @@ fn install() -> io::Result<()> {
         if RegisterClassW(&wc) == 0 {
             return Err(fail("RegisterClassW"));
         }
-        // A message-only window, there for Raw Input to deliver WM_INPUT to.
-        let hwnd = CreateWindowExW(0, class.as_ptr(), ptr::null(), 0, 0, 0, 0, 0, HWND_MESSAGE, ptr::null_mut(), module, ptr::null());
+        // A window never shown, there for Raw Input's WM_INPUT and the tray icon's messages. Not
+        // message-only: a tray menu needs a window that can come to the foreground.
+        let hwnd = CreateWindowExW(0, class.as_ptr(), ptr::null(), 0, 0, 0, 0, 0, ptr::null_mut(), ptr::null_mut(), module, ptr::null());
         if hwnd.is_null() {
             return Err(fail("CreateWindowExW"));
         }
+        WINDOW.store(hwnd, Ordering::Relaxed);
         // Generic desktop mouse, delivered even while another window has focus.
         let mouse = RAWINPUTDEVICE { usUsagePage: 1, usUsage: 2, dwFlags: RIDEV_INPUTSINK, hwndTarget: hwnd };
         if RegisterRawInputDevices(&mouse, 1, mem::size_of::<RAWINPUTDEVICE>() as u32) == 0 {
@@ -210,8 +256,13 @@ fn emit(event: Event) {
     }
 }
 
-/// Pointer motion while not grabbed, for pushing against the edge.
+/// Pointer motion while not grabbed, for pushing against the edge, and the tray icon.
 unsafe extern "system" fn window_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
+    match msg {
+        WM_TRAY_SHOW => show_tray(hwnd),
+        WM_TRAY_CLICK if matches!(lparam as u32, WM_LBUTTONUP | WM_RBUTTONUP) => tray_menu(hwnd),
+        _ => {}
+    }
     if msg == WM_INPUT
         && !GRABBED.load(Ordering::Relaxed)
         && let Some((dx, dy)) = raw_motion(lparam)
@@ -288,4 +339,82 @@ unsafe extern "system" fn mouse_proc(code: i32, wparam: WPARAM, lparam: LPARAM) 
         }
     }
     unsafe { CallNextHookEx(ptr::null_mut(), code, wparam, lparam) }
+}
+
+fn tray_data(hwnd: HWND) -> NOTIFYICONDATAW {
+    let mut data: NOTIFYICONDATAW = unsafe { mem::zeroed() };
+    data.cbSize = mem::size_of::<NOTIFYICONDATAW>() as u32;
+    data.hWnd = hwnd;
+    data.uID = 1;
+    data
+}
+
+/// Adds the icon the first time, updates it after.
+fn show_tray(hwnd: HWND) {
+    static ADDED: AtomicBool = AtomicBool::new(false);
+    static ICON: AtomicPtr<c_void> = AtomicPtr::new(ptr::null_mut());
+    let (look, status) = TRAY.lock().unwrap().clone();
+    let mut data = tray_data(hwnd);
+    data.uFlags = NIF_ICON | NIF_MESSAGE | NIF_TIP;
+    data.uCallbackMessage = WM_TRAY_CLICK;
+    data.hIcon = make_icon(look);
+    let tip: Vec<u16> = format!("Yunta: {status}").encode_utf16().take(data.szTip.len() - 1).collect();
+    data.szTip[..tip.len()].copy_from_slice(&tip);
+    let verb = if ADDED.swap(true, Ordering::Relaxed) { NIM_MODIFY } else { NIM_ADD };
+    unsafe { Shell_NotifyIconW(verb, &data) };
+    let old = ICON.swap(data.hIcon, Ordering::Relaxed);
+    if !old.is_null() {
+        unsafe { DestroyIcon(old) };
+    }
+}
+
+fn make_icon(look: Look) -> HICON {
+    // Windows wants BGRA, and an AND mask that the alpha channel makes redundant.
+    let bgra: Vec<u8> = icon::rgba(look).chunks(4).flat_map(|p| [p[2], p[1], p[0], p[3]]).collect();
+    let mask = [0u8; icon::SIZE * icon::SIZE / 8];
+    let size = icon::SIZE as i32;
+    unsafe { CreateIcon(ptr::null_mut(), size, size, 1, 32, mask.as_ptr(), bgra.as_ptr()) }
+}
+
+fn tray_menu(hwnd: HWND) {
+    const PAUSE: usize = 1;
+    const AUTOSTART: usize = 2;
+    const QUIT: usize = 3;
+    let (look, status) = TRAY.lock().unwrap().clone();
+    let paused = look == Look::Paused;
+    let autostart = autostart::enabled();
+    let wide = |s: &str| s.encode_utf16().chain([0]).collect::<Vec<u16>>();
+    let (status, pause, login, quit) = (wide(&status), wide("Pause crossing"), wide("Start at login"), wide("Quit"));
+    let checked = |on: bool| if on { MF_CHECKED } else { 0 };
+    let chosen = unsafe {
+        let menu = CreatePopupMenu();
+        AppendMenuW(menu, MF_STRING | MF_GRAYED, 0, status.as_ptr());
+        AppendMenuW(menu, MF_SEPARATOR, 0, ptr::null());
+        AppendMenuW(menu, MF_STRING | checked(paused), PAUSE, pause.as_ptr());
+        AppendMenuW(menu, MF_STRING | checked(autostart), AUTOSTART, login.as_ptr());
+        AppendMenuW(menu, MF_SEPARATOR, 0, ptr::null());
+        AppendMenuW(menu, MF_STRING, QUIT, quit.as_ptr());
+        let mut at = POINT { x: 0, y: 0 };
+        GetCursorPos(&mut at);
+        // Without this the menu does not close when clicking elsewhere.
+        SetForegroundWindow(hwnd);
+        let chosen = TrackPopupMenu(menu, TPM_RETURNCMD | TPM_NONOTIFY | TPM_RIGHTBUTTON, at.x, at.y, 0, hwnd, ptr::null());
+        DestroyMenu(menu);
+        chosen as usize
+    };
+    let send = |input| {
+        if let Some(tx) = EVENTS.get() {
+            let _ = tx.send(input);
+        }
+    };
+    match chosen {
+        PAUSE => send(Input::Pause(!paused)),
+        AUTOSTART => {
+            if let Err(e) = autostart::set(!autostart) {
+                eprintln!("start at login: {e}");
+            }
+        }
+        QUIT => send(Input::Quit),
+        _ => {}
+    }
 }

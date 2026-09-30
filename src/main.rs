@@ -1,6 +1,11 @@
+// No console window when started from the Start menu or at login; subcommands open their own.
+#![cfg_attr(windows, windows_subsystem = "windows")]
+
+mod autostart;
 mod clip;
 mod config;
 mod crossing;
+mod icon;
 mod keymap;
 mod link;
 mod msg;
@@ -13,7 +18,7 @@ mod os;
 #[path = "os/windows.rs"]
 mod os;
 
-use std::io;
+use std::io::{self, IsTerminal};
 use std::net::TcpListener;
 use std::sync::mpsc;
 use std::thread;
@@ -55,15 +60,23 @@ pub enum Input {
     Peer(Msg),
     Up(link::Sender),
     Down,
+    /// From the tray.
+    Pause(bool),
+    Quit,
 }
 
 fn main() {
     let result = match std::env::args().nth(1).as_deref() {
-        None => run(),
-        Some("init") => config::init().map(|cfg| {
+        None => {
+            os::attach_console();
+            run()
+        }
+        Some("init") => in_console(|| {
+            let cfg = config::init()?;
             println!("config: {}\nthis machine's public key: {}", cfg.path.display(), config::hex(&cfg.public));
+            Ok(())
         }),
-        Some("pair") => pair(),
+        Some("pair") => in_console(pair),
         Some(_) => {
             eprintln!("usage: yunta [init | pair]");
             std::process::exit(2);
@@ -73,6 +86,21 @@ fn main() {
         eprintln!("yunta: {e}");
         std::process::exit(1);
     }
+}
+
+/// Runs `f` in a console window of its own on Windows, left open until Enter so it can be read.
+fn in_console(f: impl FnOnce() -> io::Result<()>) -> io::Result<()> {
+    let opened = os::open_console();
+    let result = f();
+    if opened {
+        if let Err(e) = &result {
+            println!("yunta: {e}");
+        }
+        println!("\nPress Enter to close this window.");
+        let _ = io::stdin().read_line(&mut String::new());
+        os::close_console();
+    }
+    result
 }
 
 /// Pairing mode, then the other machine's key (and, on the dialing side, its address) saved.
@@ -91,10 +119,16 @@ enum Role {
 }
 
 fn run() -> io::Result<()> {
-    let cfg = config::load()?;
-    let Some(peer_key) = cfg.peer_key.clone() else {
-        return Err(io::Error::other(format!("set peer_key in {} to the other machine's public key", cfg.path.display())));
-    };
+    let mut cfg = config::init()?;
+    if cfg.peer_key.is_none() {
+        // First run: pair before anything else.
+        if !cfg!(windows) && !io::stdin().is_terminal() {
+            return Err(io::Error::other("not paired yet: run `yunta pair` in a terminal on both machines"));
+        }
+        in_console(pair)?;
+        cfg = config::load()?;
+    }
+    let peer_key = cfg.peer_key.clone().expect("paired");
     let role = match &cfg.peer {
         Some(host) => Role::Dial(host.clone()),
         // ponytail: IPv4 only, bind [::] as well if a network ever needs IPv6
@@ -102,10 +136,11 @@ fn run() -> io::Result<()> {
     };
     let (tx, rx) = mpsc::channel();
     let os = os::Os::start(tx.clone())?;
+    let tray = os::Tray::start(tx.clone());
     let (key, port) = (cfg.key.clone(), cfg.port);
     thread::spawn(move || link_thread(role, port, key, peer_key, tx));
     eprintln!("yunta running, config {}", cfg.path.display());
-    Core::new(os, cfg).run(rx);
+    Core::new(os, tray, cfg).run(rx);
     Ok(())
 }
 
@@ -176,10 +211,13 @@ struct Core {
     held_there: Vec<Msg>,
     held_here: Vec<Msg>,
     clip: Option<clip::Clip>,
+    tray: Option<os::Tray>,
+    /// Crossing at the edge is off; the shortcut still switches.
+    paused: bool,
 }
 
 impl Core {
-    fn new(os: os::Os, cfg: config::Config) -> Core {
+    fn new(os: os::Os, tray: Option<os::Tray>, cfg: config::Config) -> Core {
         let now = Instant::now();
         Core {
             displays: os.displays(),
@@ -196,13 +234,23 @@ impl Core {
             held_there: vec![],
             held_here: vec![],
             clip: clip::Clip::new(),
+            tray,
+            paused: false,
             cfg,
         }
     }
 
     fn run(mut self, rx: mpsc::Receiver<Input>) {
+        self.show_status();
         loop {
             match rx.recv_timeout(Duration::from_millis(250)) {
+                Ok(Input::Quit) => {
+                    self.fall_back();
+                    if let Some(tray) = &self.tray {
+                        tray.remove();
+                    }
+                    return;
+                }
                 Ok(input) => self.handle(input),
                 Err(mpsc::RecvTimeoutError::Timeout) => {}
                 Err(mpsc::RecvTimeoutError::Disconnected) => return,
@@ -222,11 +270,18 @@ impl Core {
             Input::Up(link) => {
                 eprintln!("linked");
                 self.link = Some(link);
+                self.show_status();
             }
             Input::Down => {
                 self.link = None;
                 self.fall_back();
+                self.show_status();
             }
+            Input::Pause(paused) => {
+                self.paused = paused;
+                self.show_status();
+            }
+            Input::Quit => {}
             Input::Local(event) => self.local(event),
             Input::Peer(msg) => self.peer(msg),
         }
@@ -236,7 +291,7 @@ impl Core {
         match event {
             Event::Motion { x, y, dx, dy, dragging } => match self.state {
                 State::Driving => self.send(Msg::Move { dx: clamp16(dx), dy: clamp16(dy) }),
-                State::Local if self.link.is_some() => {
+                State::Local if self.link.is_some() && !self.paused => {
                     if let Push::Cross(pos) = self.out.motion(&self.displays, x, y, dx, dy, dragging) {
                         self.drive(pos);
                     }
@@ -340,6 +395,16 @@ impl Core {
         let (x, y) = pos.and_then(|p| crossing::entry_point(&self.displays, self.cfg.edge, p)).unwrap_or(self.exit);
         self.os.move_to(x, y);
         self.state = State::Local;
+    }
+
+    fn show_status(&self) {
+        let Some(tray) = &self.tray else { return };
+        let (look, status) = match (self.link.is_some(), self.paused) {
+            (false, _) => (icon::Look::Waiting, "Waiting for the other machine"),
+            (true, false) => (icon::Look::Linked, "Connected"),
+            (true, true) => (icon::Look::Paused, "Connected, crossing paused"),
+        };
+        tray.show(look, status);
     }
 
     /// Whichever machine gives input away sends its clipboard, ahead of the switch itself.

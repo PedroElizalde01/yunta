@@ -21,8 +21,9 @@ use x11rb::rust_connection::RustConnection;
 use x11rb::{CURRENT_TIME, NONE};
 
 use crate::crossing::Rect;
+use crate::icon::{self, Look};
 use crate::msg::Msg;
-use crate::{Event, Input, keymap};
+use crate::{Event, Input, autostart, keymap};
 
 pub struct Os {
     conn: Arc<RustConnection>,
@@ -152,6 +153,106 @@ fn notches(pending: &mut i32, delta: i16) -> i32 {
     let whole = *pending / 120;
     *pending -= whole * 120;
     whole
+}
+
+// Consoles are a Windows matter: a Linux terminal is already there.
+pub fn attach_console() {}
+
+pub fn open_console() -> bool {
+    false
+}
+
+pub fn close_console() {}
+
+/// The tray icon and its menu, over D-Bus (StatusNotifierItem).
+pub struct Tray(ksni::blocking::Handle<TrayModel>);
+
+pub struct TrayModel {
+    look: Look,
+    status: String,
+    autostart: bool,
+    tx: mpsc::Sender<Input>,
+}
+
+impl Tray {
+    pub fn start(tx: mpsc::Sender<Input>) -> Option<Tray> {
+        use ksni::blocking::TrayMethods;
+        let model = TrayModel { look: Look::Waiting, status: String::new(), autostart: autostart::enabled(), tx };
+        match model.spawn() {
+            Ok(handle) => Some(Tray(handle)),
+            Err(e) => {
+                eprintln!("no tray icon: {e}");
+                None
+            }
+        }
+    }
+
+    pub fn show(&self, look: Look, status: &str) {
+        self.0.update(|m| {
+            m.look = look;
+            m.status = status.to_string();
+        });
+    }
+
+    pub fn remove(&self) {
+        self.0.shutdown().wait();
+    }
+}
+
+impl ksni::Tray for TrayModel {
+    fn id(&self) -> String {
+        "yunta".into()
+    }
+
+    fn title(&self) -> String {
+        "Yunta".into()
+    }
+
+    fn icon_pixmap(&self) -> Vec<ksni::Icon> {
+        // RGBA to the ARGB the spec wants.
+        let data = icon::rgba(self.look).chunks(4).flat_map(|p| [p[3], p[0], p[1], p[2]]).collect();
+        vec![ksni::Icon { width: icon::SIZE as i32, height: icon::SIZE as i32, data }]
+    }
+
+    fn tool_tip(&self) -> ksni::ToolTip {
+        ksni::ToolTip { title: format!("Yunta: {}", self.status), ..Default::default() }
+    }
+
+    fn menu(&self) -> Vec<ksni::MenuItem<Self>> {
+        use ksni::menu::{CheckmarkItem, StandardItem};
+        vec![
+            StandardItem { label: self.status.clone(), enabled: false, ..Default::default() }.into(),
+            ksni::MenuItem::Separator,
+            CheckmarkItem {
+                label: "Pause crossing".into(),
+                checked: self.look == Look::Paused,
+                activate: Box::new(|m: &mut Self| {
+                    let _ = m.tx.send(Input::Pause(m.look != Look::Paused));
+                }),
+                ..Default::default()
+            }
+            .into(),
+            CheckmarkItem {
+                label: "Start at login".into(),
+                checked: self.autostart,
+                activate: Box::new(|m: &mut Self| match autostart::set(!m.autostart) {
+                    Ok(()) => m.autostart = !m.autostart,
+                    Err(e) => eprintln!("start at login: {e}"),
+                }),
+                ..Default::default()
+            }
+            .into(),
+            ksni::MenuItem::Separator,
+            StandardItem {
+                label: "Quit".into(),
+                activate: Box::new(|m: &mut Self| {
+                    let _ = m.tx.send(Input::Quit);
+                }),
+                ..Default::default()
+            }
+            .into(),
+        ]
+    }
 }
 
 /// Raw motion always, raw keys while not grabbed.
