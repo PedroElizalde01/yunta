@@ -48,8 +48,6 @@ enum Link {
     NotPaired,
     /// Pairing mode is on in this window.
     Pairing,
-    /// Waiting for the first connection attempt to finish.
-    Waiting,
     /// Paired, running, and the other computer is not there.
     Offline,
     Waking,
@@ -117,7 +115,6 @@ pub fn run(page: Option<&str>) -> io::Result<()> {
 #[derive(Default)]
 struct Status {
     linked: bool,
-    waiting: bool,
     input: String,
     waking: bool,
     /// The other computer lets this one's keyboard and mouse in.
@@ -133,7 +130,6 @@ impl Status {
             let v = v.trim();
             match k.trim() {
                 "linked" => s.linked = v == "yes",
-                "waiting" => s.waiting = v == "yes",
                 "input" => s.input = v.to_string(),
                 "waking" => s.waking = v == "yes",
                 "peer_receives" => s.peer_receives = v == "yes",
@@ -323,8 +319,6 @@ impl App {
             if self.cfg.paused { Link::Paused } else { Link::Connected }
         } else if self.status.waking {
             Link::Waking
-        } else if self.status.waiting {
-            Link::Waiting
         } else {
             Link::Offline
         }
@@ -336,7 +330,7 @@ impl App {
         match self.link() {
             Link::NotRunning => ("Not running", p.weak),
             Link::NotPaired => ("Not paired", p.weak),
-            Link::Pairing | Link::Waiting => ("Waiting", p.warn),
+            Link::Pairing => ("Waiting", p.warn),
             Link::Offline => ("Offline", p.weak),
             Link::Waking => ("Waking", p.warn),
             Link::Connected => ("Connected", p.accent),
@@ -383,7 +377,6 @@ impl App {
             Link::Pairing => {
                 ("Waiting for the other computer".to_string(), "Pairing mode is on. Turn it on on the other computer as well.".to_string())
             }
-            Link::Waiting => (format!("Waiting for {peer}"), "Start Yunta on the other computer, on the same network.".to_string()),
             Link::Offline => {
                 (format!("{} is offline", opening(&peer)), format!("Yunta connects as soon as it runs on {peer}, on the same network."))
             }
@@ -439,7 +432,7 @@ impl App {
             let scene = match link {
                 Link::NotRunning => Scene::Stopped,
                 Link::NotPaired => Scene::Alone,
-                Link::Pairing | Link::Waiting => Scene::Searching,
+                Link::Pairing => Scene::Searching,
                 Link::Offline => Scene::Offline,
                 Link::Waking => Scene::Waking,
                 Link::Connected | Link::Paused => Scene::Linked(if self.status.input == "there" { Holder::There } else { Holder::Here }),
@@ -1394,9 +1387,8 @@ mod tests {
 
     #[test]
     fn status_parses() {
-        let s = Status::parse("linked = yes\nwaiting = no\ninput = there\ndisplays = 0 0 1920 1080; 1920 0 1920 1080\npeer_displays =\n");
-        assert!(s.linked && !s.waiting);
-        assert!(Status::parse("linked = no\nwaiting = yes\n").waiting);
+        let s = Status::parse("linked = yes\ninput = there\ndisplays = 0 0 1920 1080; 1920 0 1920 1080\npeer_displays =\n");
+        assert!(s.linked);
         assert_eq!((s.input.as_str(), s.displays.len(), s.peer_displays.len()), ("there", 2, 0));
         assert_eq!(fingerprint(&[0xAB; 32]), "abab abab abab abab");
     }

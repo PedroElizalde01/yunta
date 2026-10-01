@@ -258,8 +258,6 @@ struct Core {
     os: os::Os,
     cfg: config::Config,
     link: Option<link::Sender>,
-    /// Waiting for the first connection, until an attempt fails or the link comes up.
-    waiting: bool,
     state: State,
     displays: Vec<Rect>,
     peer_displays: Vec<Rect>,
@@ -305,7 +303,6 @@ impl Core {
             peer_displays: vec![],
             os,
             link: None,
-            waiting: true,
             state: State::Local,
             displays_at: now,
             last_send: now,
@@ -454,9 +451,8 @@ impl Core {
         };
         let yes = |b: bool| if b { "yes" } else { "no" };
         let status = format!(
-            "linked = {}\nwaiting = {}\ninput = {input}\npaused = {}\nwaking = {}\npeer_receives = {}\ndisplays = {}\npeer_displays = {}\n",
+            "linked = {}\ninput = {input}\npaused = {}\nwaking = {}\npeer_receives = {}\ndisplays = {}\npeer_displays = {}\n",
             yes(self.link.is_some()),
-            yes(self.waiting),
             yes(self.cfg.paused),
             yes(self.waking()),
             yes(self.peer_receives),
@@ -481,7 +477,6 @@ impl Core {
         match input {
             Input::Up(link, addr) => {
                 eprintln!("linked");
-                self.waiting = false;
                 self.woke_at = None;
                 self.link = Some(link);
                 self.send(Msg::Displays(self.displays.clone()));
@@ -499,7 +494,6 @@ impl Core {
                 self.show_status();
             }
             Input::Down => {
-                self.waiting = false;
                 self.link = None;
                 self.peer_receives = true;
                 self.fall_back();
@@ -792,10 +786,10 @@ impl Core {
     fn show_status(&self) {
         let Some(tray) = &self.tray else { return };
         let peer = self.cfg.peer_name.clone().unwrap_or_else(|| "the other computer".into());
-        let look = icon::Look::for_link(self.link.is_some(), self.waiting || self.waking(), self.cfg.paused);
+        // Offline whenever the other computer is not there; amber only while a wake-up is under way.
+        let look = icon::Look::for_link(self.link.is_some(), self.waking(), self.cfg.paused);
         let status = match look {
-            icon::Look::Waiting if self.waking() => format!("Waking {peer}"),
-            icon::Look::Waiting => format!("Waiting for {peer}"),
+            icon::Look::Waiting => format!("Waking {peer}"),
             icon::Look::Offline => "Offline".to_string(),
             icon::Look::Linked => format!("Connected to {peer}"),
             icon::Look::Paused => "Connected, crossing paused".to_string(),
