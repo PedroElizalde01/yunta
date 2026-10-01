@@ -159,6 +159,7 @@ enum Role {
 fn run() -> io::Result<()> {
     let mut cfg = config::init()?;
     update::tidy();
+    let _ = std::fs::remove_file(config::quit_path(&cfg.path));
     // Held until we exit: a second copy would open a second link, or fight over the input.
     // A copy restarting itself lets go of the lock as it exits, so the new one waits for that.
     let wait = if std::env::var_os(RESTART).is_some() { Duration::from_secs(3) } else { Duration::ZERO };
@@ -336,7 +337,13 @@ impl Core {
             // A held trigger key switches at its deadline, so wake up for that too.
             let wait = self.tap.deadline().map_or(TICK, |d| Duration::from_millis(d.saturating_sub(self.now())).min(TICK));
             match rx.recv_timeout(wait) {
-                Ok(Input::Quit) => return self.shut_down(),
+                Ok(Input::Quit) => {
+                    self.shut_down();
+                    if let Err(e) = std::fs::write(config::quit_path(&self.cfg.path), "") {
+                        eprintln!("quit: {e}");
+                    }
+                    return;
+                }
                 Ok(input) => self.handle(input),
                 Err(mpsc::RecvTimeoutError::Timeout) => {}
                 Err(mpsc::RecvTimeoutError::Disconnected) => return,

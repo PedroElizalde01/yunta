@@ -272,6 +272,11 @@ pub fn status_path(config: &Path) -> PathBuf {
     config.with_file_name("status")
 }
 
+/// Left by Quit in the tray, so the settings window closes with the app.
+pub fn quit_path(config: &Path) -> PathBuf {
+    config.with_file_name("quit")
+}
+
 /// Takes the lock file `name` next to yunta.conf. `None` when another process holds it. The lock
 /// lasts as long as the file stays open.
 pub fn lock(config: &Path, name: &str) -> io::Result<Option<File>> {

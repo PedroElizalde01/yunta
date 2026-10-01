@@ -168,6 +168,9 @@ struct App {
     /// This computer's name as it is being edited, until saved.
     rename: Option<String>,
     update: Arc<Mutex<Update>>,
+    /// When this window opened, and whether Yunta was quit from the tray since.
+    opened: std::time::SystemTime,
+    quit: bool,
 }
 
 /// Pairing mode in the window: the machines it found, and what was typed for each.
@@ -208,6 +211,8 @@ impl App {
             shown_at: 0.0,
             rename: None,
             update: Arc::new(Mutex::new(Update::Idle)),
+            opened: std::time::SystemTime::now(),
+            quit: false,
         };
         app.refresh();
         if app.cfg.updates {
@@ -259,6 +264,8 @@ impl App {
 
     fn refresh(&mut self) {
         self.polled = Instant::now();
+        // Quit in the tray after this window opened: it goes too.
+        self.quit = std::fs::metadata(config::quit_path(&self.cfg.path)).and_then(|m| m.modified()).is_ok_and(|t| t > self.opened);
         // ponytail: the probe holds the lock for an instant, so an app starting at that very moment says "already running"
         self.running = matches!(config::lock(&self.cfg.path, "yunta.lock"), Ok(None));
         let text =
@@ -1128,6 +1135,9 @@ impl eframe::App for App {
             self.refresh();
         }
         self.apply_theme(ui.ctx());
+        if self.quit {
+            ui.ctx().send_viewport_cmd(egui::ViewportCommand::Close);
+        }
         ui.ctx().request_repaint_after(POLL);
         let p = palette(ui);
         egui::Panel::left("nav")
