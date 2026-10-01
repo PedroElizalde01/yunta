@@ -49,6 +49,10 @@ sudo apt install mingw-w64
 rustup target add x86_64-pc-windows-gnu
 ```
 
+`./release.sh` publishes a release: it tags the version in Cargo.toml, pushes, runs
+`package.sh`, and uploads the signed files to GitHub, where the app's update check finds them.
+It refuses a dirty tree, a tag whose code has since changed, and an unsigned build.
+
 ## Security
 
 Pairing runs SPAKE2 with the code as the password, so the code never crosses the network and
