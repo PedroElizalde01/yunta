@@ -32,7 +32,7 @@ pub fn set(on: bool) -> io::Result<()> {
     }
     std::fs::create_dir_all(path.parent().expect("has a parent"))?;
     let exe = exe()?;
-    std::fs::write(path, format!("[Desktop Entry]\nType=Application\nName=Yunta\nExec=\"{}\"\nNoDisplay=true\n", exe.display()))
+    std::fs::write(path, format!("[Desktop Entry]\nType=Application\nName=Yunta\nIcon=yunta\nExec=\"{}\"\nNoDisplay=true\n", exe.display()))
 }
 
 #[cfg(windows)]
