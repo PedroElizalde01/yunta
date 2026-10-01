@@ -9,8 +9,12 @@ use std::sync::atomic::{AtomicBool, AtomicI32, AtomicPtr, Ordering};
 use std::sync::{OnceLock, mpsc};
 use std::{io, mem, ptr};
 
-use windows_sys::Win32::Foundation::{HWND, LPARAM, LRESULT, POINT, RECT, WPARAM};
-use windows_sys::Win32::Graphics::Gdi::{EnumDisplayMonitors, GetMonitorInfoW, HDC, HMONITOR, MONITORINFO};
+use windows_sys::Win32::Foundation::{HWND, LPARAM, LRESULT, POINT, RECT, SIZE, WPARAM};
+use windows_sys::Win32::Graphics::Gdi::{
+    AC_SRC_ALPHA, AC_SRC_OVER, BI_RGB, BITMAPINFO, BITMAPINFOHEADER, BLENDFUNCTION, CreateCompatibleDC, CreateDIBSection, DIB_RGB_COLORS,
+    DeleteDC, DeleteObject, EnumDisplayMonitors, GetDC, GetMonitorInfoW, HDC, HMONITOR, MONITOR_DEFAULTTONEAREST, MONITORINFO,
+    MonitorFromWindow, ReleaseDC, SelectObject,
+};
 use windows_sys::Win32::System::Console::{ATTACH_PARENT_PROCESS, AllocConsole, AttachConsole, FreeConsole};
 use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows_sys::Win32::System::Threading::{GetCurrentThread, SetThreadPriority, THREAD_PRIORITY_HIGHEST};
@@ -27,13 +31,17 @@ use windows_sys::Win32::UI::Input::{
 };
 use windows_sys::Win32::UI::Shell::{NIF_ICON, NIF_MESSAGE, NIF_TIP, NIM_ADD, NIM_DELETE, NIM_MODIFY, NOTIFYICONDATAW, Shell_NotifyIconW};
 use windows_sys::Win32::UI::WindowsAndMessaging::{
-    AppendMenuW, CallNextHookEx, CreateIcon, CreatePopupMenu, CreateWindowExW, DefWindowProcW, DestroyIcon, DestroyMenu, DispatchMessageW,
-    GetCursorPos, GetMessageW, GetSystemMetrics, HICON, KBDLLHOOKSTRUCT, LLKHF_EXTENDED, LLKHF_INJECTED, LLMHF_INJECTED, MF_CHECKED,
-    MF_GRAYED, MF_SEPARATOR, MF_STRING, MSG, MSLLHOOKSTRUCT, PostMessageW, RegisterClassW, SM_CXSCREEN, SM_CXVIRTUALSCREEN, SM_CYSCREEN,
-    SM_CYVIRTUALSCREEN, SM_XVIRTUALSCREEN, SM_YVIRTUALSCREEN, SetCursorPos, SetForegroundWindow, SetWindowsHookExW, TPM_NONOTIFY,
-    TPM_RETURNCMD, TPM_RIGHTBUTTON, TrackPopupMenu, WH_KEYBOARD_LL, WH_MOUSE_LL, WM_APP, WM_INPUT, WM_KEYDOWN, WM_LBUTTONDOWN,
-    WM_LBUTTONUP, WM_MBUTTONDOWN, WM_MBUTTONUP, WM_MOUSEHWHEEL, WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_RBUTTONDOWN, WM_RBUTTONUP, WM_SYSKEYDOWN,
-    WM_XBUTTONDOWN, WM_XBUTTONUP, WNDCLASSW, XBUTTON1, XBUTTON2,
+    AppendMenuW, CallNextHookEx, CreateCursor, CreateIcon, CreatePopupMenu, CreateWindowExW, DefWindowProcW, DestroyIcon, DestroyMenu,
+    DispatchMessageW, GetClassNameW, GetCursorPos, GetDesktopWindow, GetForegroundWindow, GetMessageW, GetShellWindow, GetSystemMetrics,
+    GetWindowRect, HICON, KBDLLHOOKSTRUCT, LLKHF_EXTENDED, LLKHF_INJECTED, LLMHF_INJECTED, MF_CHECKED, MF_GRAYED, MF_SEPARATOR, MF_STRING,
+    MSG, MSLLHOOKSTRUCT, OCR_APPSTARTING, OCR_CROSS, OCR_HAND, OCR_HELP, OCR_IBEAM, OCR_NO, OCR_NORMAL, OCR_SIZEALL, OCR_SIZENESW,
+    OCR_SIZENS, OCR_SIZENWSE, OCR_SIZEWE, OCR_UP, OCR_WAIT, PM_REMOVE, PeekMessageW, PostMessageW, RegisterClassW, SM_CXSCREEN,
+    SM_CXVIRTUALSCREEN, SM_CYSCREEN, SM_CYVIRTUALSCREEN, SM_XVIRTUALSCREEN, SM_YVIRTUALSCREEN, SPI_SETCURSORS, SW_HIDE, SW_SHOWNOACTIVATE,
+    SetCursorPos, SetForegroundWindow, SetSystemCursor, SetWindowsHookExW, ShowWindow, SystemParametersInfoW, TPM_NONOTIFY, TPM_RETURNCMD,
+    TPM_RIGHTBUTTON, TrackPopupMenu, ULW_ALPHA, UpdateLayeredWindow, WH_KEYBOARD_LL, WH_MOUSE_LL, WM_APP, WM_INPUT, WM_KEYDOWN,
+    WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MBUTTONDOWN, WM_MBUTTONUP, WM_MOUSEHWHEEL, WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_RBUTTONDOWN, WM_RBUTTONUP,
+    WM_SYSKEYDOWN, WM_XBUTTONDOWN, WM_XBUTTONUP, WNDCLASSW, WS_EX_LAYERED, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_EX_TOPMOST,
+    WS_EX_TRANSPARENT, WS_POPUP, XBUTTON1, XBUTTON2,
 };
 use windows_sys::core::BOOL;
 
@@ -48,6 +56,8 @@ const MARK: usize = 0x5955_4E54;
 // The hook and window procedures take no context, so what they share lives here.
 static EVENTS: OnceLock<mpsc::Sender<Input>> = OnceLock::new();
 static GRABBED: AtomicBool = AtomicBool::new(false);
+/// Keys and mouse buttons that reach Windows even while grabbed: they stay on this PC.
+static KEPT: Mutex<(Vec<u16>, Vec<u8>)> = Mutex::new((Vec::new(), Vec::new()));
 /// While grabbed the cursor is parked here, and each swallowed move is measured from it. That
 /// keeps Windows' pointer acceleration, which Raw Input's counts do not have.
 static PARK: (AtomicI32, AtomicI32) = (AtomicI32::new(0), AtomicI32::new(0));
@@ -96,6 +106,8 @@ impl Os {
     pub fn start(tx: mpsc::Sender<Input>) -> io::Result<Os> {
         // Physical pixels on every monitor, whatever its scaling, so positions line up.
         unsafe { SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2) };
+        // A crash while driving leaves the cursors blank (panic aborts, nothing cleans up).
+        hide_cursors(false);
         EVENTS.set(tx).map_err(|_| io::Error::other("input capture started twice"))?;
         let (ready_tx, ready) = mpsc::channel();
         std::thread::spawn(move || {
@@ -145,14 +157,48 @@ impl Os {
     /// Swallows this PC's input in the hooks, or stops swallowing it.
     pub fn grab(&self, on: bool) -> bool {
         if on {
-            // ponytail: the parked cursor stays visible in the middle of the primary display
             let (x, y) = unsafe { (GetSystemMetrics(SM_CXSCREEN) / 2, GetSystemMetrics(SM_CYSCREEN) / 2) };
             PARK.0.store(x, Ordering::Relaxed);
             PARK.1.store(y, Ordering::Relaxed);
             unsafe { SetCursorPos(x, y) };
         }
-        GRABBED.store(on, Ordering::Relaxed);
+        if GRABBED.swap(on, Ordering::Relaxed) != on {
+            hide_cursors(on);
+        }
         true
+    }
+
+    /// The keys and buttons that stay here while driving: the hooks let them through.
+    pub fn keep(&self, keys: &[u16], buttons: &[u8]) {
+        *KEPT.lock().unwrap() = (keys.to_vec(), buttons.to_vec());
+    }
+
+    /// Kept keys and buttons already reached Windows through the hooks.
+    pub fn play_local(&self, _msg: &Msg) -> bool {
+        true
+    }
+
+    /// True when the window in front fills its monitor, as a game or a film does. The desktop
+    /// itself fills the screen too, and does not count.
+    pub fn fullscreen(&self) -> bool {
+        unsafe {
+            let window = GetForegroundWindow();
+            if window.is_null() || window == GetShellWindow() || window == GetDesktopWindow() {
+                return false;
+            }
+            let mut class = [0u16; 32];
+            let n = GetClassNameW(window, class.as_mut_ptr(), class.len() as i32).max(0) as usize;
+            if matches!(String::from_utf16_lossy(&class[..n]).as_str(), "Progman" | "WorkerW") {
+                return false;
+            }
+            let mut rect: RECT = mem::zeroed();
+            let mut info: MONITORINFO = mem::zeroed();
+            info.cbSize = mem::size_of::<MONITORINFO>() as u32;
+            GetWindowRect(window, &mut rect) != 0
+                && GetMonitorInfoW(MonitorFromWindow(window, MONITOR_DEFAULTTONEAREST), &mut info) != 0
+                && (rect.left, rect.top, rect.right, rect.bottom)
+                    == (info.rcMonitor.left, info.rcMonitor.top, info.rcMonitor.right, info.rcMonitor.bottom)
+        }
     }
 
     pub fn inject(&self, msg: &Msg) {
@@ -160,7 +206,9 @@ impl Os {
             Msg::Key { hid, down } => {
                 let Some(scan) = keymap::scan_from_hid(hid) else { return };
                 let up = if down { 0 } else { KEYEVENTF_KEYUP };
-                if hid == 0x48 {
+                if let Some(vk) = keymap::media_vk(hid) {
+                    key(vk, 0, up)
+                } else if hid == 0x48 {
                     // Pause has no scan code SendInput understands, only a virtual key.
                     key(VK_PAUSE, 0, up)
                 } else {
@@ -195,6 +243,126 @@ impl Os {
             _ => return,
         };
         send(input);
+    }
+}
+
+/// A see-through window for the crossing animations: layered, above everything, never focused,
+/// and clicks go through it.
+pub struct Overlay {
+    hwnd: HWND,
+    shown: bool,
+}
+
+impl Overlay {
+    pub fn new() -> Option<Overlay> {
+        unsafe {
+            let module = GetModuleHandleW(ptr::null());
+            let class: Vec<u16> = "yunta-fx\0".encode_utf16().collect();
+            let wc = WNDCLASSW { lpfnWndProc: Some(DefWindowProcW), hInstance: module, lpszClassName: class.as_ptr(), ..mem::zeroed() };
+            // Fails harmlessly when this process registered it already.
+            RegisterClassW(&wc);
+            let ex = WS_EX_LAYERED | WS_EX_TRANSPARENT | WS_EX_TOPMOST | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE;
+            let hwnd = CreateWindowExW(
+                ex,
+                class.as_ptr(),
+                ptr::null(),
+                WS_POPUP,
+                0,
+                0,
+                1,
+                1,
+                ptr::null_mut(),
+                ptr::null_mut(),
+                module,
+                ptr::null(),
+            );
+            (!hwnd.is_null()).then_some(Overlay { hwnd, shown: false })
+        }
+    }
+
+    /// Shows `bgra` (premultiplied, `w` x `h`) with its top left corner at (x, y).
+    pub fn show(&mut self, x: i32, y: i32, w: u32, h: u32, bgra: &[u8]) {
+        unsafe {
+            let screen = GetDC(ptr::null_mut());
+            let dc = CreateCompatibleDC(screen);
+            let mut info: BITMAPINFO = mem::zeroed();
+            info.bmiHeader = BITMAPINFOHEADER {
+                biSize: mem::size_of::<BITMAPINFOHEADER>() as u32,
+                biWidth: w as i32,
+                // Negative: rows run top down, as in `bgra`.
+                biHeight: -(h as i32),
+                biPlanes: 1,
+                biBitCount: 32,
+                biCompression: BI_RGB,
+                ..mem::zeroed()
+            };
+            let mut bits = ptr::null_mut();
+            let bitmap = CreateDIBSection(dc, &info, DIB_RGB_COLORS, &mut bits, ptr::null_mut(), 0);
+            if !bitmap.is_null() && !bits.is_null() {
+                ptr::copy_nonoverlapping(bgra.as_ptr(), bits as *mut u8, bgra.len().min((w * h * 4) as usize));
+                let old = SelectObject(dc, bitmap);
+                let blend =
+                    BLENDFUNCTION { BlendOp: AC_SRC_OVER as u8, BlendFlags: 0, SourceConstantAlpha: 255, AlphaFormat: AC_SRC_ALPHA as u8 };
+                let (at, size, origin) = (POINT { x, y }, SIZE { cx: w as i32, cy: h as i32 }, POINT { x: 0, y: 0 });
+                UpdateLayeredWindow(self.hwnd, screen, &at, &size, dc, &origin, 0, &blend, ULW_ALPHA);
+                SelectObject(dc, old);
+                DeleteObject(bitmap);
+            }
+            DeleteDC(dc);
+            ReleaseDC(ptr::null_mut(), screen);
+            if !self.shown {
+                ShowWindow(self.hwnd, SW_SHOWNOACTIVATE);
+                self.shown = true;
+            }
+        }
+    }
+
+    pub fn hide(&mut self) {
+        if self.shown {
+            unsafe { ShowWindow(self.hwnd, SW_HIDE) };
+            self.shown = false;
+        }
+    }
+
+    /// The window's messages, which only this thread can take.
+    pub fn pump(&mut self) {
+        let mut msg: MSG = unsafe { mem::zeroed() };
+        while unsafe { PeekMessageW(&mut msg, self.hwnd, 0, 0, PM_REMOVE) } != 0 {
+            unsafe { DispatchMessageW(&msg) };
+        }
+    }
+}
+
+/// Blanks every system cursor, so the parked one disappears while the peer has input, or puts
+/// the user's cursor scheme back. Session-wide: it outlives us if we die blanked.
+fn hide_cursors(hide: bool) {
+    if !hide {
+        unsafe { SystemParametersInfoW(SPI_SETCURSORS, 0, ptr::null_mut(), 0) };
+        return;
+    }
+    // 32x32 monochrome: an AND mask of ones and an XOR mask of zeros is see-through everywhere.
+    let (and, xor) = ([0xFFu8; 128], [0u8; 128]);
+    for id in [
+        OCR_NORMAL,
+        OCR_IBEAM,
+        OCR_WAIT,
+        OCR_CROSS,
+        OCR_UP,
+        OCR_SIZENWSE,
+        OCR_SIZENESW,
+        OCR_SIZEWE,
+        OCR_SIZENS,
+        OCR_SIZEALL,
+        OCR_NO,
+        OCR_HAND,
+        OCR_APPSTARTING,
+        OCR_HELP,
+    ] {
+        // SetSystemCursor takes the cursor over, so each id gets one of its own.
+        unsafe {
+            let blank = CreateCursor(GetModuleHandleW(ptr::null()), 0, 0, 32, 32, and.as_ptr().cast(), xor.as_ptr().cast());
+            SetSystemCursor(blank, id);
+        }
     }
 }
 
@@ -260,7 +428,9 @@ fn emit(event: Event) {
 unsafe extern "system" fn window_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
     match msg {
         WM_TRAY_SHOW => show_tray(hwnd),
-        WM_TRAY_CLICK if matches!(lparam as u32, WM_LBUTTONUP | WM_RBUTTONUP) => tray_menu(hwnd),
+        // A click opens the settings, as tray icons do on Windows; a right click the menu.
+        WM_TRAY_CLICK if lparam as u32 == WM_LBUTTONUP => crate::open_settings(None),
+        WM_TRAY_CLICK if lparam as u32 == WM_RBUTTONUP => tray_menu(hwnd),
         _ => {}
     }
     if msg == WM_INPUT
@@ -303,7 +473,8 @@ unsafe extern "system" fn keyboard_proc(code: i32, wparam: WPARAM, lparam: LPARA
             if let Some(hid) = u16::try_from(scan).ok().and_then(keymap::hid_from_scan) {
                 emit(Event::Key { hid, down });
             }
-            if GRABBED.load(Ordering::Relaxed) {
+            let kept = u16::try_from(scan).ok().and_then(keymap::hid_from_scan).is_some_and(|hid| KEPT.lock().unwrap().0.contains(&hid));
+            if GRABBED.load(Ordering::Relaxed) && !kept {
                 return 1;
             }
         }
@@ -332,10 +503,13 @@ unsafe extern "system" fn mouse_proc(code: i32, wparam: WPARAM, lparam: LPARAM) 
                 WM_MOUSEHWHEEL => Some(Event::Scroll { dx: wheel, dy: 0 }),
                 _ => None,
             };
+            let kept = matches!(event, Some(Event::Button { button, .. }) if KEPT.lock().unwrap().1.contains(&button));
             if let Some(event) = event {
                 emit(event);
             }
-            return 1;
+            if !kept {
+                return 1;
+            }
         }
     }
     unsafe { CallNextHookEx(ptr::null_mut(), code, wparam, lparam) }
@@ -380,16 +554,21 @@ fn tray_menu(hwnd: HWND) {
     const PAUSE: usize = 1;
     const AUTOSTART: usize = 2;
     const QUIT: usize = 3;
+    const SETTINGS: usize = 4;
+    const PAIR: usize = 5;
     let (look, status) = TRAY.lock().unwrap().clone();
     let paused = look == Look::Paused;
     let autostart = autostart::enabled();
     let wide = |s: &str| s.encode_utf16().chain([0]).collect::<Vec<u16>>();
-    let (status, pause, login, quit) = (wide(&status), wide("Pause crossing"), wide("Start at login"), wide("Quit"));
+    let (status, settings, pair) = (wide(&status), wide("Settings…"), wide("Pair a new computer…"));
+    let (pause, login, quit) = (wide("Pause crossing"), wide("Start at login"), wide("Quit"));
     let checked = |on: bool| if on { MF_CHECKED } else { 0 };
     let chosen = unsafe {
         let menu = CreatePopupMenu();
         AppendMenuW(menu, MF_STRING | MF_GRAYED, 0, status.as_ptr());
         AppendMenuW(menu, MF_SEPARATOR, 0, ptr::null());
+        AppendMenuW(menu, MF_STRING, SETTINGS, settings.as_ptr());
+        AppendMenuW(menu, MF_STRING, PAIR, pair.as_ptr());
         AppendMenuW(menu, MF_STRING | checked(paused), PAUSE, pause.as_ptr());
         AppendMenuW(menu, MF_STRING | checked(autostart), AUTOSTART, login.as_ptr());
         AppendMenuW(menu, MF_SEPARATOR, 0, ptr::null());
@@ -415,6 +594,8 @@ fn tray_menu(hwnd: HWND) {
             }
         }
         QUIT => send(Input::Quit),
+        SETTINGS => crate::open_settings(None),
+        PAIR => crate::open_settings(Some("pairing")),
         _ => {}
     }
 }

@@ -18,6 +18,7 @@ use x11rb::protocol::xkb::{self, ConnectionExt as _};
 use x11rb::protocol::xproto::{self, ConnectionExt as _, GrabMode, GrabStatus};
 use x11rb::protocol::xtest::ConnectionExt as _;
 use x11rb::rust_connection::RustConnection;
+use x11rb::wrapper::ConnectionExt as _;
 use x11rb::{CURRENT_TIME, NONE};
 
 use crate::crossing::Rect;
@@ -34,6 +35,8 @@ pub struct Os {
     grabbed: Arc<AtomicBool>,
     /// Scrolling not yet a whole wheel notch, since X only knows notches.
     scroll: Cell<(i32, i32)>,
+    /// _NET_ACTIVE_WINDOW, _NET_WM_STATE and _NET_WM_STATE_FULLSCREEN, for spotting a full-screen app.
+    atoms: [u32; 3],
 }
 
 impl Os {
@@ -60,14 +63,35 @@ impl Os {
             .reply()
             .map_err(other)?;
         let blank = blank_cursor(&grab_conn, root)?;
+        // Touchpad swipes, from X servers with XInput 2.4. Their bits run past the first word of
+        // the mask: begin and update are bits 30 and 31, end is bit 32.
+        let gestures = grab_conn
+            .xinput_xi_query_version(2, 4)
+            .ok()
+            .and_then(|c| c.reply().ok())
+            .is_some_and(|v| (v.major_version, v.minor_version) >= (2, 4));
+        if gestures {
+            let mask = vec![xinput::XIEventMask::from(3u32 << 30), xinput::XIEventMask::from(1u32)];
+            let _ = grab_conn.xinput_xi_select_events(root, &[xinput::EventMask { deviceid: xinput::Device::ALL_MASTER.into(), mask }]);
+        }
         grab_conn.flush().map_err(other)?;
+        let atom = |name: &str| conn.intern_atom(false, name.as_bytes()).ok().and_then(|c| c.reply().ok()).map_or(NONE, |r| r.atom);
+        let atoms = [atom("_NET_ACTIVE_WINDOW"), atom("_NET_WM_STATE"), atom("_NET_WM_STATE_FULLSCREEN")];
 
-        let os =
-            Os { conn: conn.clone(), grab_conn: grab_conn.clone(), screen, root, blank, grabbed: Arc::default(), scroll: Cell::default() };
-        let grabbed = os.grabbed.clone();
-        let tx2 = tx.clone();
+        let grabbed = Arc::<AtomicBool>::default();
+        let os = Os {
+            conn: conn.clone(),
+            grab_conn: grab_conn.clone(),
+            screen,
+            root,
+            blank,
+            grabbed: grabbed.clone(),
+            scroll: Cell::default(),
+            atoms,
+        };
+        let (grabbed2, tx2) = (grabbed.clone(), tx.clone());
         std::thread::spawn(move || capture(conn, root, grabbed, tx));
-        std::thread::spawn(move || grabbed_input(grab_conn, tx2));
+        std::thread::spawn(move || grabbed_input(grab_conn, grabbed2, tx2));
         Ok(os)
     }
 
@@ -95,24 +119,68 @@ impl Os {
     /// Takes the pointer and keyboard away from every other app, or gives them back.
     pub fn grab(&self, on: bool) -> bool {
         self.grabbed.store(on, Ordering::Relaxed);
-        let conn = &self.grab_conn;
         if !on {
-            let _ = conn.ungrab_keyboard(CURRENT_TIME);
-            let _ = conn.ungrab_pointer(CURRENT_TIME);
-            let _ = conn.flush();
+            let _ = self.grab_conn.ungrab_keyboard(CURRENT_TIME);
+            let _ = self.grab_conn.ungrab_pointer(CURRENT_TIME);
+            let _ = self.grab_conn.flush();
             return true;
         }
-        let buttons = xproto::EventMask::BUTTON_PRESS | xproto::EventMask::BUTTON_RELEASE;
-        let pointer = conn.grab_pointer(false, self.root, buttons, GrabMode::ASYNC, GrabMode::ASYNC, NONE, self.blank, CURRENT_TIME);
-        let keyboard = conn.grab_keyboard(false, self.root, CURRENT_TIME, GrabMode::ASYNC, GrabMode::ASYNC);
-        let ok = |status: Option<GrabStatus>| status == Some(GrabStatus::SUCCESS);
-        if ok(pointer.ok().and_then(|c| c.reply().ok()).map(|r| r.status))
-            && ok(keyboard.ok().and_then(|c| c.reply().ok()).map(|r| r.status))
-        {
+        if self.grab_pointer() && self.grab_keyboard() {
             return true;
         }
         self.grab(false);
         false
+    }
+
+    fn grab_pointer(&self) -> bool {
+        let buttons = xproto::EventMask::BUTTON_PRESS | xproto::EventMask::BUTTON_RELEASE;
+        let grab = self.grab_conn.grab_pointer(false, self.root, buttons, GrabMode::ASYNC, GrabMode::ASYNC, NONE, self.blank, CURRENT_TIME);
+        grab.ok().and_then(|c| c.reply().ok()).is_some_and(|r| r.status == GrabStatus::SUCCESS)
+    }
+
+    fn grab_keyboard(&self) -> bool {
+        let grab = self.grab_conn.grab_keyboard(false, self.root, CURRENT_TIME, GrabMode::ASYNC, GrabMode::ASYNC);
+        grab.ok().and_then(|c| c.reply().ok()).is_some_and(|r| r.status == GrabStatus::SUCCESS)
+    }
+
+    /// The keys and buttons that stay here while driving. X11 grabs all or nothing, so they are
+    /// played here by `play_local` instead.
+    pub fn keep(&self, _keys: &[u16], _buttons: &[u8]) {}
+
+    /// Plays a key or button meant for this computer while the grab holds everything: lets go,
+    /// presses and releases it here, and takes hold again. False if the grab cannot be taken back.
+    // ponytail: press and release at once, so a kept key cannot be held down; fine for volume, media and side buttons
+    pub fn play_local(&self, msg: &Msg) -> bool {
+        let (keyboard, down) = match *msg {
+            Msg::Key { down, .. } => (true, down),
+            Msg::Button { down, .. } => (false, down),
+            _ => return true,
+        };
+        if !down {
+            return true;
+        }
+        let _ = if keyboard { self.grab_conn.ungrab_keyboard(CURRENT_TIME) } else { self.grab_conn.ungrab_pointer(CURRENT_TIME) };
+        let _ = self.grab_conn.flush();
+        self.inject(msg);
+        let up = match *msg {
+            Msg::Key { hid, .. } => Msg::Key { hid, down: false },
+            Msg::Button { button, .. } => Msg::Button { button, down: false },
+            _ => unreachable!(),
+        };
+        self.inject(&up);
+        let _ = self.conn.sync();
+        if keyboard { self.grab_keyboard() } else { self.grab_pointer() }
+    }
+
+    /// True when the focused window is full screen, as a game or a film is.
+    pub fn fullscreen(&self) -> bool {
+        let [active, state, fullscreen] = self.atoms;
+        let prop = |window: u32, name: u32| {
+            self.conn.get_property(false, window, name, xproto::AtomEnum::ANY, 0, 64).ok().and_then(|c| c.reply().ok())
+        };
+        let Some(window) = prop(self.root, active).and_then(|r| r.value32().and_then(|mut v| v.next())) else { return false };
+        window != NONE
+            && prop(window, state).and_then(|r| r.value32().map(|v| v.collect::<Vec<_>>())).is_some_and(|s| s.contains(&fullscreen))
     }
 
     pub fn inject(&self, msg: &Msg) {
@@ -214,6 +282,11 @@ impl ksni::Tray for TrayModel {
         vec![ksni::Icon { width: icon::SIZE as i32, height: icon::SIZE as i32, data }]
     }
 
+    /// A left click on the icon.
+    fn activate(&mut self, _x: i32, _y: i32) {
+        crate::open_settings(None);
+    }
+
     fn tool_tip(&self) -> ksni::ToolTip {
         ksni::ToolTip { title: format!("Yunta: {}", self.status), ..Default::default() }
     }
@@ -223,6 +296,16 @@ impl ksni::Tray for TrayModel {
         vec![
             StandardItem { label: self.status.clone(), enabled: false, ..Default::default() }.into(),
             ksni::MenuItem::Separator,
+            StandardItem {
+                label: "Settings…".into(), activate: Box::new(|_: &mut Self| crate::open_settings(None)), ..Default::default()
+            }
+            .into(),
+            StandardItem {
+                label: "Pair a new computer…".into(),
+                activate: Box::new(|_: &mut Self| crate::open_settings(Some("pairing"))),
+                ..Default::default()
+            }
+            .into(),
             CheckmarkItem {
                 label: "Pause crossing".into(),
                 checked: self.look == Look::Paused,
@@ -301,10 +384,28 @@ fn capture(conn: Arc<RustConnection>, root: u32, grabbed: Arc<AtomicBool>, tx: m
     }
 }
 
-/// Keys and buttons, which reach the grab connection only while it holds the grab.
-fn grabbed_input(conn: Arc<RustConnection>, tx: mpsc::Sender<Input>) {
+/// Keys and buttons, which reach the grab connection only while it holds the grab, and
+/// touchpad swipes, which count only then.
+fn grabbed_input(conn: Arc<RustConnection>, grabbed: Arc<AtomicBool>, tx: mpsc::Sender<Input>) {
+    // Where the current swipe has got to, in pixels.
+    let mut swipe = (0.0f64, 0.0f64);
     loop {
         let out = match next_event(&conn) {
+            XEvent::XinputGestureSwipeBegin(_) => {
+                swipe = (0.0, 0.0);
+                None
+            }
+            XEvent::XinputGestureSwipeUpdate(e) => {
+                swipe.0 += f64::from(e.delta_x) / 65536.0;
+                swipe.1 += f64::from(e.delta_y) / 65536.0;
+                None
+            }
+            XEvent::XinputGestureSwipeEnd(e) if grabbed.load(Ordering::Relaxed) => {
+                let cancelled = u32::from(e.flags) & u32::from(xinput::GestureSwipeEventFlags::GESTURE_SWIPE_CANCELLED) != 0;
+                swipe_direction(swipe.0, swipe.1)
+                    .filter(|_| !cancelled && (3..=4).contains(&e.detail))
+                    .map(|direction| Event::Gesture { fingers: e.detail as u8, direction })
+            }
             XEvent::KeyPress(e) => key(e.detail.into(), true),
             XEvent::KeyRelease(e) => key(e.detail.into(), false),
             XEvent::ButtonPress(e) => button(e.detail, true),
@@ -316,6 +417,18 @@ fn grabbed_input(conn: Arc<RustConnection>, tx: mpsc::Sender<Input>) {
         {
             return;
         }
+    }
+}
+
+/// 0 up, 1 down, 2 left, 3 right, for a swipe that went far enough to mean it.
+fn swipe_direction(dx: f64, dy: f64) -> Option<u8> {
+    const FAR: f64 = 60.0;
+    match (dx.abs() > dy.abs(), dx, dy) {
+        (true, dx, _) if dx <= -FAR => Some(2),
+        (true, dx, _) if dx >= FAR => Some(3),
+        (false, _, dy) if dy <= -FAR => Some(0),
+        (false, _, dy) if dy >= FAR => Some(1),
+        _ => None,
     }
 }
 
@@ -383,12 +496,91 @@ fn blank_cursor(conn: &RustConnection, root: u32) -> io::Result<u32> {
     Ok(cursor)
 }
 
+/// A see-through window for the crossing animations: 32-bit colour with alpha, above everything,
+/// out of the window manager's hands, and with no input area, so clicks go through it.
+pub struct Overlay {
+    conn: RustConnection,
+    window: u32,
+    gc: u32,
+    mapped: bool,
+    at: (i32, i32, u32, u32),
+}
+
+impl Overlay {
+    /// None without a compositor: without one, the alpha would show as black.
+    pub fn new() -> Option<Overlay> {
+        Overlay::make().map_err(|e| eprintln!("no crossing animations: {e}")).ok().flatten()
+    }
+
+    fn make() -> io::Result<Option<Overlay>> {
+        use x11rb::protocol::shape::{self, ConnectionExt as _};
+        let (conn, screen) = x11rb::connect(None).map_err(other)?;
+        let s = &conn.setup().roots[screen];
+        let root = s.root;
+        let atom = conn.intern_atom(false, format!("_NET_WM_CM_S{screen}").as_bytes()).map_err(other)?.reply().map_err(other)?.atom;
+        if conn.get_selection_owner(atom).map_err(other)?.reply().map_err(other)?.owner == NONE {
+            return Ok(None);
+        }
+        let visual = s
+            .allowed_depths
+            .iter()
+            .filter(|d| d.depth == 32)
+            .flat_map(|d| &d.visuals)
+            .find(|v| v.class == xproto::VisualClass::TRUE_COLOR)
+            .map(|v| v.visual_id)
+            .ok_or_else(|| io::Error::other("the X server has no 32-bit visual"))?;
+        let colormap = conn.generate_id().map_err(other)?;
+        conn.create_colormap(xproto::ColormapAlloc::NONE, colormap, root, visual).map_err(other)?;
+        let window = conn.generate_id().map_err(other)?;
+        let aux = xproto::CreateWindowAux::new().background_pixel(0).border_pixel(0).colormap(colormap).override_redirect(1);
+        conn.create_window(32, window, root, 0, 0, 1, 1, 0, xproto::WindowClass::INPUT_OUTPUT, visual, &aux).map_err(other)?;
+        conn.shape_rectangles(shape::SO::SET, shape::SK::INPUT, xproto::ClipOrdering::UNSORTED, window, 0, 0, &[]).map_err(other)?;
+        let gc = conn.generate_id().map_err(other)?;
+        conn.create_gc(gc, window, &xproto::CreateGCAux::new()).map_err(other)?;
+        conn.flush().map_err(other)?;
+        Ok(Some(Overlay { conn, window, gc, mapped: false, at: (0, 0, 0, 0) }))
+    }
+
+    /// Shows `bgra` (premultiplied, `w` x `h`) with its top left corner at (x, y).
+    pub fn show(&mut self, x: i32, y: i32, w: u32, h: u32, bgra: &[u8]) {
+        if self.at != (x, y, w, h) {
+            let aux = xproto::ConfigureWindowAux::new().x(x).y(y).width(w).height(h).stack_mode(xproto::StackMode::ABOVE);
+            let _ = self.conn.configure_window(self.window, &aux);
+            self.at = (x, y, w, h);
+        }
+        if !self.mapped {
+            let _ = self.conn.map_window(self.window);
+            self.mapped = true;
+        }
+        let _ = self.conn.put_image(xproto::ImageFormat::Z_PIXMAP, self.window, self.gc, w as u16, h as u16, 0, 0, 0, 32, bgra);
+        let _ = self.conn.flush();
+    }
+
+    pub fn hide(&mut self) {
+        if self.mapped {
+            let _ = self.conn.unmap_window(self.window);
+            let _ = self.conn.flush();
+            self.mapped = false;
+        }
+    }
+
+    /// Windows needs its message queue emptied; X11 needs nothing.
+    pub fn pump(&mut self) {}
+}
+
 fn other(e: impl std::error::Error + Send + Sync + 'static) -> io::Error {
     io::Error::other(e)
 }
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn swipes_need_to_go_somewhere() {
+        assert_eq!(super::swipe_direction(-200.0, 30.0), Some(2));
+        assert_eq!(super::swipe_direction(10.0, 150.0), Some(1));
+        assert_eq!(super::swipe_direction(20.0, -15.0), None);
+    }
+
     #[test]
     fn notches_carry_the_remainder() {
         let mut pending = 0;

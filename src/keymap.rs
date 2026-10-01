@@ -40,7 +40,85 @@ const KEYS: &[(u16, u16, u16)] = &[
     (0x87, 89, 0x73), (0x88, 93, 0x70), (0x89, 124, 0x7D), (0x8A, 92, 0x79), (0x8B, 94, 0x7B), // JIS
     (0xE0, 29, 0x1D), (0xE1, 42, 0x2A), (0xE2, 56, 0x38), (0xE3, 125, 0xE05B), // LCtrl LShift LAlt LSuper
     (0xE4, 97, 0xE01D), (0xE5, 54, 0x36), (0xE6, 100, 0xE038), (0xE7, 126, 0xE05C), // right-hand ones
+    // Media keys live on HID's consumer page, not the keyboard one. They travel as these
+    // keyboard-page usages, which HID leaves reserved.
+    (PLAY_PAUSE, 164, 0xE022), (NEXT_TRACK, 163, 0xE019), (PREVIOUS_TRACK, 165, 0xE010), (STOP, 166, 0xE024),
 ];
+
+pub const PLAY_PAUSE: u16 = 0xF0;
+pub const NEXT_TRACK: u16 = 0xF1;
+pub const PREVIOUS_TRACK: u16 = 0xF2;
+pub const STOP: u16 = 0xF3;
+pub const MUTE: u16 = 0x7F;
+pub const VOLUME_UP: u16 = 0x80;
+pub const VOLUME_DOWN: u16 = 0x81;
+pub const PRINT_SCREEN: u16 = 0x46;
+pub const LEFT_CTRL: u16 = 0xE0;
+pub const LEFT_SUPER: u16 = 0xE3;
+pub const RIGHT_CTRL: u16 = 0xE4;
+pub const RIGHT_SUPER: u16 = 0xE7;
+
+/// The Windows virtual key for keys Windows only acts on when sent as one: the media and volume
+/// keys. Sent as scan codes they arrive but do nothing.
+#[cfg_attr(not(windows), allow(dead_code))]
+pub fn media_vk(hid: u16) -> Option<u16> {
+    Some(match hid {
+        PLAY_PAUSE => 0xB3,
+        NEXT_TRACK => 0xB0,
+        PREVIOUS_TRACK => 0xB1,
+        STOP => 0xB2,
+        MUTE => 0xAD,
+        VOLUME_DOWN => 0xAE,
+        VOLUME_UP => 0xAF,
+        _ => return None,
+    })
+}
+
+/// Ctrl and Super trade places, so a Mac keyboard's Cmd, which Linux reads as Super, works as
+/// Ctrl on the other computer.
+pub fn swap_modifiers(hid: u16) -> u16 {
+    match hid {
+        LEFT_CTRL => LEFT_SUPER,
+        LEFT_SUPER => LEFT_CTRL,
+        RIGHT_CTRL => RIGHT_SUPER,
+        RIGHT_SUPER => RIGHT_CTRL,
+        other => other,
+    }
+}
+
+/// The Windows shortcut a touchpad swipe plays, as the keys to press in order. Windows' own
+/// touchpad does the same: up for Task View, down for the desktop, sideways with three fingers
+/// to switch apps and with four to switch desktops.
+pub fn gesture_keys(fingers: u8, direction: u8) -> &'static [u16] {
+    const ALT: u16 = 0xE2;
+    const SHIFT: u16 = 0xE1;
+    const TAB: u16 = 0x2B;
+    match (fingers, direction) {
+        (_, 0) => &[LEFT_SUPER, TAB],
+        (_, 1) => &[LEFT_SUPER, 0x07], // D
+        (3, 2) => &[ALT, TAB],
+        (3, 3) => &[ALT, SHIFT, TAB],
+        // Fingers left bring in the desktop on the right, as on a real touchpad.
+        (_, 2) => &[LEFT_CTRL, LEFT_SUPER, 0x4F],
+        (_, 3) => &[LEFT_CTRL, LEFT_SUPER, 0x50],
+        _ => &[],
+    }
+}
+
+/// The keys in a group `keep` can name; `side_buttons` is mouse buttons, see `kept_buttons`.
+pub fn kept_keys(group: &str) -> &'static [u16] {
+    match group {
+        "volume" => &[MUTE, VOLUME_UP, VOLUME_DOWN],
+        "media" => &[PLAY_PAUSE, NEXT_TRACK, PREVIOUS_TRACK, STOP],
+        "print_screen" => &[PRINT_SCREEN],
+        _ => &[],
+    }
+}
+
+/// Back and forward, the mouse's side buttons.
+pub fn kept_buttons(group: &str) -> &'static [u8] {
+    if group == "side_buttons" { &[4, 5] } else { &[] }
+}
 
 // Each platform uses its own half: evdev on Linux, scan codes on Windows.
 // ponytail: linear scans over ~120 rows per keystroke, a 256-entry lookup table if it ever shows up in a profile
@@ -82,5 +160,7 @@ mod tests {
         assert_eq!(hid_from_evdev(30), Some(0x04)); // A
         assert_eq!(hid_from_scan(0xE04D), Some(0x4F)); // Right arrow
         assert_eq!(evdev_from_hid(0x66), None); // Power never crosses
+        assert_eq!((hid_from_evdev(164), hid_from_scan(0xE022)), (Some(PLAY_PAUSE), Some(PLAY_PAUSE)));
+        assert_eq!(swap_modifiers(swap_modifiers(LEFT_CTRL)), LEFT_CTRL);
     }
 }
