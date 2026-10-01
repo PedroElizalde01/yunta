@@ -437,7 +437,9 @@ impl App {
                 Link::Waking => Scene::Waking,
                 Link::Connected | Link::Paused => Scene::Linked(if self.status.input == "there" { Holder::There } else { Holder::Here }),
             };
-            let there = if self.cfg.peer_key.is_some() { opening(&peer) } else { "The other computer".to_string() };
+            // While pairing, the space is for whichever computer comes, not the one paired before.
+            let there =
+                if self.cfg.peer_key.is_some() && link != Link::Pairing { opening(&peer) } else { "The other computer".to_string() };
             widgets::two_screens(ui, &self.name, &there, self.cfg.layout.edge == Edge::Left, scene);
             if !matches!(scene, Scene::Offline | Scene::Alone | Scene::Stopped) {
                 ui.ctx().request_repaint_after(Duration::from_millis(33));

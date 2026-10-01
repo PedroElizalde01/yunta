@@ -421,11 +421,14 @@ pub fn two_screens(ui: &mut egui::Ui, here: &str, there: &str, peer_left: bool, 
             }
         }
         Scene::Searching => {
-            // Rings going out from this computer, towards where the other one will be.
-            let c = Pos2::new(if peer_left { ours.left() } else { ours.right() }, ours.center().y);
-            for k in 0..3 {
-                let t = (time * 0.5 + k as f32 / 3.0) % 1.0;
-                painter.circle_stroke(c, 10.0 + t * gap * 0.7, Stroke::new(2.0, p.accent.gamma_multiply(0.5 * (1.0 - t))));
+            // A dotted line reaching from this computer towards the space for the other one,
+            // its dots flowing that way.
+            let (from, to) = if peer_left { (b, a) } else { (a, b) };
+            let flow = (time * 24.0) % 10.0;
+            for shape in
+                Shape::dashed_line_with_offset(&[from, to], Stroke::new(2.0, p.accent.gamma_multiply(0.7)), &[4.0], &[6.0], 10.0 - flow)
+            {
+                painter.add(shape);
             }
         }
         Scene::Alone => {}
@@ -437,13 +440,26 @@ pub fn two_screens(ui: &mut egui::Ui, here: &str, there: &str, peer_left: bool, 
     let dim = matches!(scene, Scene::Offline | Scene::Waking | Scene::Stopped);
     monitor(&painter, p, ours, here, here_active, scene == Scene::Stopped, time);
     if placeholder {
-        // A dashed outline where the other computer will stand.
+        // A dashed outline where the other computer will stand. In pairing mode it is in the
+        // accent and breathes, with three dots inside taking turns, as something on its way.
         let r = theirs;
+        let searching = scene == Scene::Searching;
+        let breathe = 0.55 + 0.3 * (time * 2.2).sin();
+        let outline = if searching { p.accent.gamma_multiply(breathe) } else { p.weak.gamma_multiply(0.6) };
         let pts = [r.left_top(), r.right_top(), r.right_bottom(), r.left_bottom(), r.left_top()];
-        for shape in Shape::dashed_line(&pts, Stroke::new(1.5, p.weak.gamma_multiply(0.6)), 6.0, 5.0) {
+        for shape in Shape::dashed_line(&pts, Stroke::new(1.5, outline), 6.0, 5.0) {
             painter.add(shape);
         }
-        painter.text(r.center(), Align2::CENTER_CENTER, "+", FontId::new(26.0, semibold()), p.weak.gamma_multiply(0.8));
+        if searching {
+            for k in 0..3 {
+                let phase = (time * 2.4 - k as f32 * 0.35).rem_euclid(std::f32::consts::TAU);
+                let lift = phase.sin().max(0.0);
+                let at = r.center() + Vec2::new((k as f32 - 1.0) * 12.0, -4.0 * lift);
+                painter.circle_filled(at, 3.0, p.accent.gamma_multiply(0.45 + 0.55 * lift));
+            }
+        } else {
+            painter.text(r.center(), Align2::CENTER_CENTER, "+", FontId::new(26.0, semibold()), p.weak.gamma_multiply(0.8));
+        }
         painter.text(r.center_bottom() + Vec2::new(0.0, 30.0), Align2::CENTER_CENTER, there, FontId::new(13.0, semibold()), p.weak);
     } else {
         let stirring = scene == Scene::Waking;
