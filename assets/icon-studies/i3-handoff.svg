@@ -1,0 +1,5 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" fill="none" color="#3fb950" role="img" aria-labelledby="title">
+  <title id="title">I3 Handoff — a pointer crosses the screen edge</title>
+  <path d="M24 12H10a4 4 0 0 0-4 4v32a4 4 0 0 0 4 4h14m16-40h14a4 4 0 0 1 4 4v32a4 4 0 0 1-4 4H40" stroke="currentColor" stroke-width="5" stroke-linecap="round"/>
+  <path d="m24 22 25 12-12 4-5 12Z" fill="currentColor"/>
+</svg>

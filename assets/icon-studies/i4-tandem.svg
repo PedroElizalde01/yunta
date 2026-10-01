@@ -1,0 +1,5 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" fill="currentColor" color="#3fb950" role="img" aria-labelledby="title">
+  <title id="title">I4 Tandem — a pair moving together</title>
+  <path d="M18 13h14L22 51H8a4 4 0 0 1-4-5l8-28a7 7 0 0 1 6-5Z"/>
+  <path d="M42 13h14a4 4 0 0 1 4 5l-8 28a7 7 0 0 1-6 5H32Z"/>
+</svg>

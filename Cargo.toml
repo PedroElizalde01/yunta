@@ -6,8 +6,11 @@ edition = "2024"
 [dependencies]
 arboard = { version = "3.6.1", default-features = false, features = ["image-data"] }
 chacha20poly1305 = "0.10"
+ed25519-dalek = { version = "2.2.0", default-features = false }
+eframe = { version = "0.36.2", default-features = false, features = ["glow", "default_fonts", "x11", "accesskit"] }
 getrandom = "0.3"
 image = { version = "0.25.10", default-features = false, features = ["png"] }
+sha2 = { version = "0.10", default-features = false }
 # Only the Noise_KK_25519_ChaChaPoly_BLAKE2s primitives. Not "std": in snow 0.10 it drags in ring.
 snow = { version = "0.10.0", default-features = false, features = ["default-resolver", "use-chacha20poly1305", "use-blake2", "use-curve25519", "use-getrandom"] }
 spake2 = "0.4.0"
@@ -20,7 +23,7 @@ panic = "abort"
 
 [target.'cfg(target_os = "linux")'.dependencies]
 ksni = { version = "0.3.6", default-features = false, features = ["async-io", "blocking"] }
-x11rb = { version = "0.13.2", features = ["xinput", "randr", "xkb", "xtest"] }
+x11rb = { version = "0.13.2", features = ["xinput", "randr", "xkb", "xtest", "shape"] }
 
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.61.2", features = ["Win32_Foundation", "Win32_Graphics_Gdi", "Win32_UI_Input_KeyboardAndMouse", "Win32_UI_WindowsAndMessaging", "Win32_UI_HiDpi", "Win32_UI_Input", "Win32_System_LibraryLoader", "Win32_System_Threading", "Win32_UI_Shell", "Win32_System_Console", "Win32_System_Registry"] }

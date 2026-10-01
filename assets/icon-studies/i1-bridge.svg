@@ -1,0 +1,8 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" fill="none" color="#3fb950" role="img" aria-labelledby="title">
+  <title id="title">I1 Bridge — two screens, one connection</title>
+  <g stroke="currentColor" stroke-width="5" stroke-linecap="round" stroke-linejoin="round">
+    <rect x="5" y="15" width="22" height="27" rx="4"/>
+    <rect x="37" y="15" width="22" height="27" rx="4"/>
+    <path d="M27 29h10M16 42v8m32-8v8M10 50h12m20 0h12"/>
+  </g>
+</svg>
