@@ -10,7 +10,8 @@
 
 use std::io::{self, BufRead, Read, Write};
 use std::net::{IpAddr, SocketAddr, TcpListener, TcpStream, UdpSocket};
-use std::sync::mpsc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, mpsc};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -26,6 +27,8 @@ const LIFETIME: Duration = Duration::from_secs(120);
 const ATTEMPTS: u32 = 3;
 const TIMEOUT: Duration = Duration::from_secs(5);
 const MSG_MAX: usize = 512;
+/// How often the pairing threads look up to see whether pairing mode is over.
+const POLL: Duration = Duration::from_millis(200);
 const ID_JOIN: &[u8] = b"yunta-join";
 const ID_HOST: &[u8] = b"yunta-host";
 
@@ -40,96 +43,174 @@ pub struct Paired {
     pub dialer: bool,
 }
 
-enum Step {
+/// What happens in pairing mode, as `Mode::next` reports it.
+pub enum Event {
+    /// Another machine in pairing mode.
     Found(String, IpAddr),
-    Typed(String),
+    /// Paired: the other machine's key and name, ready to save.
     Paired(Paired),
-    WrongCode(IpAddr),
+    /// Someone typed a wrong code for ours: `n` of the attempts allowed. The host thread sends
+    /// 0, and `next` counts.
+    WrongCode(IpAddr, u32),
+    /// The code we typed is not the one that machine shows.
+    Refused(IpAddr),
+    /// Trying a code for that machine failed for another reason.
+    Failed(IpAddr, String),
 }
 
-pub fn run(public: &[u8]) -> io::Result<Paired> {
-    let code = new_code();
-    let name = machine_name();
-    let id = format!("{:016x}", random_u64());
-    let (tx, rx) = mpsc::channel();
+/// Pairing mode while it lasts: the beacon, the list it builds and the port where a code can
+/// be tried. Dropping it ends pairing mode and closes both ports.
+pub struct Mode {
+    pub code: String,
+    pub name: String,
+    public: Vec<u8>,
+    tx: mpsc::Sender<Event>,
+    rx: mpsc::Receiver<Event>,
+    deadline: Instant,
+    wrong: u32,
+    stop: Arc<AtomicBool>,
+}
 
-    let host = TcpListener::bind(("0.0.0.0", PORT)).map_err(|e| io::Error::new(e.kind(), format!("pairing port {PORT}: {e}")))?;
-    let beacons = UdpSocket::bind(("0.0.0.0", PORT)).map_err(|e| io::Error::new(e.kind(), format!("pairing port {PORT}/udp: {e}")))?;
-    println!("Pairing mode is on for two minutes. This machine is {name}, and its code is  {code}\n");
+impl Mode {
+    pub fn start(public: &[u8], name: &str) -> io::Result<Mode> {
+        let host = TcpListener::bind(("0.0.0.0", PORT)).map_err(|e| io::Error::new(e.kind(), format!("pairing port {PORT}: {e}")))?;
+        let beacons = UdpSocket::bind(("0.0.0.0", PORT)).map_err(|e| io::Error::new(e.kind(), format!("pairing port {PORT}/udp: {e}")))?;
+        // Both wake up now and then to see whether pairing mode is over.
+        host.set_nonblocking(true)?;
+        beacons.set_read_timeout(Some(POLL))?;
+        let (tx, rx) = mpsc::channel();
+        let mode = Mode {
+            code: new_code(),
+            name: name.to_string(),
+            public: public.to_vec(),
+            tx,
+            rx,
+            deadline: Instant::now() + LIFETIME,
+            wrong: 0,
+            stop: Arc::default(),
+        };
+        let id = format!("{:016x}", random_u64());
+        let beacon = format!("{MAGIC}\n{id}\n{}", mode.name);
+        let stop = mode.stop.clone();
+        thread::spawn(move || announce(&beacon, &stop));
+        let (found, stop) = (mode.tx.clone(), mode.stop.clone());
+        thread::spawn(move || listen(&beacons, &id, &found, &stop));
+        let (hosted, key, name, code, stop) =
+            (mode.tx.clone(), mode.public.clone(), mode.name.clone(), mode.code.clone(), mode.stop.clone());
+        thread::spawn(move || host_codes(&host, &code, &key, &name, &hosted, &stop));
+        Ok(mode)
+    }
+
+    /// How long pairing mode has left.
+    pub fn left(&self) -> Duration {
+        self.deadline.saturating_duration_since(Instant::now())
+    }
+
+    /// Tries `code` as the one `addr` shows, on a thread of its own. The outcome comes from `next`.
+    pub fn join(&self, addr: IpAddr, code: &str) {
+        let (tx, public, name, code) = (self.tx.clone(), self.public.clone(), self.name.clone(), code.to_string());
+        thread::spawn(move || {
+            let event = match join(SocketAddr::new(addr, PORT), &code, &public, &name) {
+                Ok((peer_key, name)) => Event::Paired(Paired { peer_key, name, addr, dialer: true }),
+                Err(e) if e.kind() == io::ErrorKind::PermissionDenied => Event::Refused(addr),
+                Err(e) => Event::Failed(addr, e.to_string()),
+            };
+            let _ = tx.send(event);
+        });
+    }
+
+    /// The next thing that happened, waiting up to `wait` for it. An error once pairing mode
+    /// is over: timed out, or too many wrong codes.
+    pub fn next(&mut self, wait: Duration) -> io::Result<Option<Event>> {
+        if self.left().is_zero() {
+            return Err(io::Error::new(io::ErrorKind::TimedOut, "pairing mode timed out"));
+        }
+        let Ok(event) = self.rx.recv_timeout(wait.min(self.left())) else { return Ok(None) };
+        if let Event::WrongCode(addr, _) = event {
+            self.wrong += 1;
+            if self.wrong >= ATTEMPTS {
+                return Err(io::Error::new(io::ErrorKind::PermissionDenied, "too many wrong codes, pairing mode is off"));
+            }
+            return Ok(Some(Event::WrongCode(addr, self.wrong)));
+        }
+        Ok(Some(event))
+    }
+}
+
+impl Drop for Mode {
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::Relaxed);
+    }
+}
+
+/// Pairing in the terminal: `yunta pair`.
+pub fn run(public: &[u8], name: &str) -> io::Result<Paired> {
+    let mut mode = Mode::start(public, name)?;
+    let code = mode.code.clone();
+    println!("Pairing mode is on for two minutes. This machine is {}, and its code is  {code}\n", mode.name);
     println!("On the other machine, run `yunta pair` too. Then, on one of the two, type the number");
     println!("of the other machine and the code it shows, like `1 {code}`. An address works as well.\n");
-
-    let beacon = format!("{MAGIC}\n{id}\n{name}");
-    thread::spawn(move || announce(&beacon));
-    let found = tx.clone();
-    thread::spawn(move || listen(&beacons, &id, &found));
-    let (hosted, key, host_name, host_code) = (tx.clone(), public.to_vec(), name.clone(), code.clone());
-    thread::spawn(move || {
-        for stream in host.incoming().flatten() {
-            let Ok(addr) = stream.peer_addr().map(|a| a.ip()) else { continue };
-            if !link::is_lan(addr) {
-                continue;
-            }
-            let step = match serve(stream, &host_code, &key, &host_name) {
-                Ok((peer_key, name)) => Step::Paired(Paired { peer_key, name, addr, dialer: false }),
-                Err(e) if e.kind() == io::ErrorKind::PermissionDenied => Step::WrongCode(addr),
-                Err(_) => continue,
-            };
-            if hosted.send(step).is_err() {
-                return;
-            }
-        }
-    });
+    let (typed_tx, typed) = mpsc::channel();
     thread::spawn(move || {
         for line in io::stdin().lock().lines().map_while(Result::ok) {
-            if tx.send(Step::Typed(line)).is_err() {
+            if typed_tx.send(line).is_err() {
                 return;
             }
         }
     });
-
-    let deadline = Instant::now() + LIFETIME;
     let mut machines: Vec<(String, IpAddr)> = vec![];
-    let mut wrong = 0;
     loop {
-        let left = deadline.saturating_duration_since(Instant::now());
-        let step = rx.recv_timeout(left).map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "pairing mode timed out"))?;
-        match step {
-            Step::Found(name, addr) if !machines.iter().any(|m| m.1 == addr) => {
+        for line in typed.try_iter() {
+            let mut words = line.split_whitespace();
+            let (Some(target), Some(typed), None) = (words.next(), words.next(), words.next()) else {
+                println!("Type the machine's number (or address) and its code, like `1 {code}`.");
+                continue;
+            };
+            match target.parse::<usize>() {
+                Ok(n) if (1..=machines.len()).contains(&n) => mode.join(machines[n - 1].1, typed),
+                _ => match target.parse::<IpAddr>() {
+                    Ok(addr) => mode.join(addr, typed),
+                    Err(_) => println!("No machine {target} in the list."),
+                },
+            }
+        }
+        match mode.next(POLL)? {
+            Some(Event::Found(name, addr)) if !machines.iter().any(|m| m.1 == addr) => {
+                println!("  [{}] {name} ({addr})", machines.len() + 1);
                 machines.push((name, addr));
-                println!("  [{}] {} ({addr})", machines.len(), machines[machines.len() - 1].0);
             }
-            Step::Found(..) => {}
-            Step::Typed(line) => {
-                let mut words = line.split_whitespace();
-                let (Some(target), Some(typed), None) = (words.next(), words.next(), words.next()) else {
-                    println!("Type the machine's number (or address) and its code, like `1 {code}`.");
-                    continue;
-                };
-                let addr = match target.parse::<usize>() {
-                    Ok(n) if (1..=machines.len()).contains(&n) => machines[n - 1].1,
-                    _ => match target.parse::<IpAddr>() {
-                        Ok(addr) => addr,
-                        Err(_) => {
-                            println!("No machine {target} in the list.");
-                            continue;
-                        }
-                    },
-                };
-                match join(SocketAddr::new(addr, PORT), typed, public, &name) {
-                    Ok((peer_key, name)) => return Ok(Paired { peer_key, name, addr, dialer: true }),
-                    Err(e) if e.kind() == io::ErrorKind::PermissionDenied => println!("That code is not the one {addr} shows."),
-                    Err(e) => println!("Could not pair with {addr}: {e}"),
-                }
+            Some(Event::Paired(paired)) => return Ok(paired),
+            Some(Event::WrongCode(addr, n)) => println!("{addr} tried a wrong code ({n} of {ATTEMPTS})."),
+            Some(Event::Refused(addr)) => println!("That code is not the one {addr} shows."),
+            Some(Event::Failed(addr, e)) => println!("Could not pair with {addr}: {e}"),
+            Some(Event::Found(..)) | None => {}
+        }
+    }
+}
+
+/// Takes codes typed on other machines for ours, until pairing mode is over.
+fn host_codes(host: &TcpListener, code: &str, public: &[u8], name: &str, tx: &mpsc::Sender<Event>, stop: &AtomicBool) {
+    while !stop.load(Ordering::Relaxed) {
+        let stream = match host.accept() {
+            Ok((stream, _)) => stream,
+            Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
+                thread::sleep(POLL);
+                continue;
             }
-            Step::Paired(paired) => return Ok(paired),
-            Step::WrongCode(addr) => {
-                wrong += 1;
-                println!("{addr} tried a wrong code ({wrong} of {ATTEMPTS}).");
-                if wrong >= ATTEMPTS {
-                    return Err(io::Error::new(io::ErrorKind::PermissionDenied, "too many wrong codes, pairing mode is off"));
-                }
-            }
+            Err(_) => continue,
+        };
+        let Ok(addr) = stream.peer_addr().map(|a| a.ip()) else { continue };
+        // ponytail: one attempt at a time, so a stranger can hold the port for up to TIMEOUT
+        if !link::is_lan(addr) || stream.set_nonblocking(false).is_err() {
+            continue;
+        }
+        let event = match serve(stream, code, public, name) {
+            Ok((peer_key, name)) => Event::Paired(Paired { peer_key, name, addr, dialer: false }),
+            Err(e) if e.kind() == io::ErrorKind::PermissionDenied => Event::WrongCode(addr, 0),
+            Err(_) => continue,
+        };
+        if tx.send(event).is_err() {
+            return;
         }
     }
 }
@@ -202,7 +283,7 @@ fn read_msg(stream: &mut TcpStream) -> io::Result<Vec<u8>> {
     Ok(msg)
 }
 
-fn announce(beacon: &str) {
+fn announce(beacon: &str, stop: &AtomicBool) {
     let Ok(socket) = UdpSocket::bind(("0.0.0.0", 0)) else { return };
     let _ = socket.set_broadcast(true);
     // ponytail: the limited broadcast plus a /24 guess; typing an address covers other networks
@@ -211,7 +292,7 @@ fn announce(beacon: &str) {
         let [a, b, c, _] = ip.octets();
         targets.push([a, b, c, 255].into());
     }
-    loop {
+    while !stop.load(Ordering::Relaxed) {
         for target in &targets {
             let _ = socket.send_to(beacon.as_bytes(), (*target, PORT));
         }
@@ -219,9 +300,10 @@ fn announce(beacon: &str) {
     }
 }
 
-fn listen(socket: &UdpSocket, own_id: &str, tx: &mpsc::Sender<Step>) {
+fn listen(socket: &UdpSocket, own_id: &str, tx: &mpsc::Sender<Event>, stop: &AtomicBool) {
     let mut buf = [0u8; 256];
-    while let Ok((n, from)) = socket.recv_from(&mut buf) {
+    while !stop.load(Ordering::Relaxed) {
+        let Ok((n, from)) = socket.recv_from(&mut buf) else { continue };
         let text = String::from_utf8_lossy(&buf[..n]);
         let mut lines = text.lines();
         let (Some(MAGIC), Some(id), Some(name)) = (lines.next(), lines.next(), lines.next()) else { continue };
@@ -229,7 +311,7 @@ fn listen(socket: &UdpSocket, own_id: &str, tx: &mpsc::Sender<Step>) {
             continue;
         }
         let name = name.chars().filter(|c| !c.is_control()).take(64).collect();
-        if tx.send(Step::Found(name, from.ip())).is_err() {
+        if tx.send(Event::Found(name, from.ip())).is_err() {
             return;
         }
     }
@@ -291,6 +373,16 @@ mod tests {
         let (host, joined) = attempt("123457");
         assert_eq!(host.unwrap_err().kind(), io::ErrorKind::PermissionDenied);
         assert_eq!(joined.unwrap_err().kind(), io::ErrorKind::PermissionDenied);
+    }
+
+    #[test]
+    fn ending_pairing_mode_closes_its_ports() {
+        let mode = Mode::start(&[1; 32], "test").unwrap();
+        assert!(TcpListener::bind(("0.0.0.0", PORT)).is_err());
+        drop(mode);
+        thread::sleep(POLL * 3);
+        assert!(TcpListener::bind(("0.0.0.0", PORT)).is_ok());
+        assert!(UdpSocket::bind(("0.0.0.0", PORT)).is_ok());
     }
 
     #[test]
