@@ -13,6 +13,16 @@ impl Edge {
         [Edge::Left, Edge::Right, Edge::Top, Edge::Bottom].get(v as usize).copied()
     }
 
+    /// As written in yunta.conf.
+    pub fn name(self) -> &'static str {
+        match self {
+            Edge::Left => "left",
+            Edge::Right => "right",
+            Edge::Top => "top",
+            Edge::Bottom => "bottom",
+        }
+    }
+
     pub fn opposite(self) -> Edge {
         match self {
             Edge::Left => Edge::Right,
@@ -48,8 +58,78 @@ pub struct Rect {
 }
 
 impl Rect {
+    /// `x y w h` per display, `;` between them, as in the status file.
+    pub fn list_text(rects: &[Rect]) -> String {
+        rects.iter().map(|r| format!("{} {} {} {}", r.x, r.y, r.w, r.h)).collect::<Vec<_>>().join("; ")
+    }
+
+    pub fn parse_list(text: &str) -> Vec<Rect> {
+        text.split(';')
+            .filter_map(|r| match r.split_whitespace().map(str::parse).collect::<Result<Vec<i32>, _>>().ok()?[..] {
+                [x, y, w, h] if w > 0 && h > 0 => Some(Rect { x, y, w, h }),
+                _ => None,
+            })
+            .collect()
+    }
+
     fn contains(&self, x: i32, y: i32) -> bool {
         x >= self.x && x < self.x + self.w && y >= self.y && y < self.y + self.h
+    }
+}
+
+/// How the two machines sit side by side: our `edge` leads to the peer, and the stretch `ours`
+/// of it (in 0..65535 of our span along that edge) faces the stretch `theirs` of the peer's.
+/// Fractions, so screen sizes and scaling on either side do not matter. `stamp` is when it was
+/// last changed, in Unix milliseconds; the newer layout wins when the two machines meet.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Layout {
+    pub edge: Edge,
+    pub ours: (u16, u16),
+    pub theirs: (u16, u16),
+    pub stamp: u64,
+    /// The two touch at a corner only: `ours` and `theirs` are each one end of the edge, and
+    /// crossing takes a diagonal push into that corner.
+    pub corner: bool,
+}
+
+/// How near the corner the pointer must be to cross there, in pixels.
+pub const CORNER_BOX: i32 = 8;
+
+impl Default for Layout {
+    fn default() -> Layout {
+        Layout { edge: Edge::Right, ours: (0, u16::MAX), theirs: (0, u16::MAX), stamp: 0, corner: false }
+    }
+}
+
+impl Layout {
+    /// The same arrangement seen from the peer.
+    pub fn mirror(self) -> Layout {
+        Layout { edge: self.edge.opposite(), ours: self.theirs, theirs: self.ours, ..self }
+    }
+
+    /// True where our edge faces the peer. At a corner, that is only the corner itself, and
+    /// `corner_push` decides.
+    pub fn covers(self, pos: u16) -> bool {
+        self.corner || (self.ours.0..=self.ours.1).contains(&pos)
+    }
+
+    /// For a corner: the pointer at (x, y) is in the corner and the move (dx, dy) heads into it
+    /// along the edge as well as out through it.
+    pub fn corner_push(self, displays: &[Rect], x: i32, y: i32, dx: i32, dy: i32) -> bool {
+        let Some((start, len)) = span(displays, self.edge) else { return false };
+        let (v, dv) = if self.edge.vertical() { (y, dy) } else { (x, dx) };
+        let at_start = self.ours.0 < u16::MAX / 2;
+        let target = if at_start { start } else { start + len - 1 };
+        (v - target).abs() <= CORNER_BOX && if at_start { dv < 0 } else { dv > 0 }
+    }
+
+    /// A position along our edge as the matching position along the peer's, which is what
+    /// `Enter` and `Leave` carry. Outside the facing stretch it goes to the nearest end.
+    pub fn to_peer(self, pos: u16) -> u16 {
+        let ((a0, a1), (b0, b1)) = (self.ours, self.theirs);
+        let along = pos.clamp(a0, a1) - a0;
+        let span = u32::from(a1 - a0).max(1);
+        (u32::from(b0) + (u32::from(along) * u32::from(b1 - b0) + span / 2) / span) as u16
     }
 }
 
@@ -73,6 +153,11 @@ pub struct Crossing {
 impl Crossing {
     pub fn new(edge: Edge, resistance: i32) -> Crossing {
         Crossing { edge, resistance, pressure: 0 }
+    }
+
+    /// Lets go of any push built up so far.
+    pub fn reset(&mut self) {
+        self.pressure = 0;
     }
 
     /// Feed every pointer motion: where the pointer is now, and the raw motion that moved it.
@@ -144,22 +229,29 @@ fn span(displays: &[Rect], edge: Edge) -> Option<(i32, i32)> {
     Some((lo, hi - lo))
 }
 
-/// Double-tap a key to switch. Fires on the second release within `window_ms` of the first,
-/// and only for clean taps, so Ctrl+C never counts as a tap of Ctrl.
-pub struct DoubleTap {
+/// How long the trigger key is held, alone, to switch in hold mode.
+pub const HOLD_MS: u64 = 400;
+
+/// The trigger key: switches on a double-tap, or in hold mode when held alone for `HOLD_MS`.
+/// Only clean presses count either way, so Ctrl+C is never a tap or a hold of Ctrl.
+pub struct Trigger {
     pub hid: u16,
     pub window_ms: u64,
+    pub hold: bool,
     held: bool,
     dirty: bool,
     last_tap: Option<u64>,
+    down_at: u64,
+    fired: bool,
 }
 
-impl DoubleTap {
-    pub fn new(hid: u16, window_ms: u64) -> DoubleTap {
-        DoubleTap { hid, window_ms, held: false, dirty: false, last_tap: None }
+impl Trigger {
+    pub fn new(hid: u16, window_ms: u64, hold: bool) -> Trigger {
+        Trigger { hid, window_ms, hold, held: false, dirty: false, last_tap: None, down_at: 0, fired: false }
     }
 
-    /// Feed every key event. Returns true when the switch should happen.
+    /// Feed every key event. True when the switch should happen (double-tap mode only; a hold
+    /// fires from `tick`).
     pub fn key(&mut self, hid: u16, down: bool, now_ms: u64) -> bool {
         if hid != self.hid {
             self.dirty |= self.held;
@@ -169,13 +261,12 @@ impl DoubleTap {
         if down {
             // Auto-repeat sends more downs while held. They change nothing.
             if !self.held {
-                self.held = true;
-                self.dirty = false;
+                (self.held, self.dirty, self.down_at, self.fired) = (true, false, now_ms, false);
             }
             return false;
         }
         self.held = false;
-        if self.dirty {
+        if self.dirty || self.hold {
             self.last_tap = None;
             return false;
         }
@@ -186,6 +277,20 @@ impl DoubleTap {
                 false
             }
         }
+    }
+
+    /// When a hold would switch, if the key is being held for one.
+    pub fn deadline(&self) -> Option<u64> {
+        (self.hold && self.held && !self.dirty && !self.fired).then_some(self.down_at + HOLD_MS)
+    }
+
+    /// True once, when a hold has lasted long enough.
+    pub fn tick(&mut self, now_ms: u64) -> bool {
+        if self.deadline().is_some_and(|d| now_ms >= d) {
+            self.fired = true;
+            return true;
+        }
+        false
     }
 }
 
@@ -233,6 +338,39 @@ mod tests {
     }
 
     #[test]
+    fn layout_maps_the_facing_stretch() {
+        // Our upper half faces the peer's whole edge.
+        let l = Layout { edge: Edge::Left, ours: (0, 32767), theirs: (0, 65535), stamp: 5, corner: false };
+        assert!(l.covers(0) && l.covers(32767) && !l.covers(40000));
+        assert_eq!((l.to_peer(0), l.to_peer(16384), l.to_peer(32767)), (0, 32769, 65535));
+        assert_eq!(l.to_peer(60000), 65535); // a shortcut switch from below lands at the end
+        let m = l.mirror();
+        assert_eq!(m, Layout { edge: Edge::Right, ours: (0, 65535), theirs: (0, 32767), stamp: 5, corner: false });
+        assert_eq!(m.to_peer(l.to_peer(16384)), 16384);
+        assert_eq!(Layout::default().to_peer(12345), 12345);
+        let point = Layout { ours: (100, 100), ..l };
+        assert_eq!(point.to_peer(100), 0);
+    }
+
+    #[test]
+    fn corners_take_a_diagonal_push() {
+        // The top right corner of A, the peer up and to the right.
+        let l = Layout { edge: Edge::Right, ours: (0, 0), theirs: (65535, 65535), stamp: 0, corner: true };
+        assert!(l.corner_push(&[A], 1919, 3, 5, -2));
+        assert!(!l.corner_push(&[A], 1919, 3, 5, 0)); // straight out is not into the corner
+        assert!(!l.corner_push(&[A], 1919, 40, 5, -2)); // too far down the edge
+        assert_eq!(l.to_peer(0), 65535); // lands in the peer's bottom left
+        assert!(l.mirror().corner);
+    }
+
+    #[test]
+    fn rect_lists_round_trip() {
+        assert_eq!(Rect::parse_list(&Rect::list_text(&[A, B])), vec![A, B]);
+        assert_eq!(Rect::parse_list(""), vec![]);
+        assert_eq!(Rect::parse_list("1 2 3; 0 0 10 10; 0 0 0 5"), vec![Rect { x: 0, y: 0, w: 10, h: 10 }]);
+    }
+
+    #[test]
     fn steps_stay_on_screen() {
         assert_eq!(step_within(&[A, B], 1900, 500, 1950, 510), (1950, 510)); // onto B
         assert_eq!(step_within(&[A, B], 1900, 100, 1950, 110), (1919, 110)); // nothing beside A up here
@@ -240,8 +378,24 @@ mod tests {
     }
 
     #[test]
+    fn hold() {
+        let mut t = Trigger::new(0xE4, 300, true);
+        assert!(!t.key(0xE4, true, 0));
+        assert_eq!(t.deadline(), Some(HOLD_MS));
+        assert!(!t.tick(HOLD_MS - 1) && t.tick(HOLD_MS));
+        assert!(!t.tick(HOLD_MS + 50)); // once per hold
+        assert!(!t.key(0xE4, false, 900));
+        // Ctrl+C held long is not a hold.
+        assert!(!t.key(0xE4, true, 1000) && !t.key(0x06, true, 1100));
+        assert!(!t.tick(2000));
+        // In hold mode a double-tap does nothing.
+        let mut t = Trigger::new(0xE4, 300, true);
+        assert!(!t.key(0xE4, true, 0) && !t.key(0xE4, false, 50) && !t.key(0xE4, true, 100) && !t.key(0xE4, false, 150));
+    }
+
+    #[test]
     fn double_tap() {
-        let mut t = DoubleTap::new(0xE4, 300);
+        let mut t = Trigger::new(0xE4, 300, false);
         assert!(!t.key(0xE4, true, 0) && !t.key(0xE4, false, 50));
         assert!(!t.key(0xE4, true, 100) && !t.key(0xE4, true, 130)); // repeat
         assert!(t.key(0xE4, false, 150));
@@ -249,7 +403,7 @@ mod tests {
         assert!(!t.key(0xE4, true, 1000) && !t.key(0xE4, false, 1050));
         assert!(!t.key(0xE4, true, 1500) && !t.key(0xE4, false, 1550));
         // Ctrl+C in between is a shortcut, not a tap.
-        let mut t = DoubleTap::new(0xE4, 300);
+        let mut t = Trigger::new(0xE4, 300, false);
         assert!(!t.key(0xE4, true, 0) && !t.key(0x06, true, 20) && !t.key(0x06, false, 30) && !t.key(0xE4, false, 40));
         assert!(!t.key(0xE4, true, 100) && !t.key(0xE4, false, 150));
     }
