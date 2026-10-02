@@ -504,16 +504,18 @@ impl Core {
         })
     }
 
-    /// Saves what we learnt about the computer in use: `setting` (its hardware address or name)
-    /// and the same in its entry in the list of paired ones, in one write.
-    fn note_peer(&mut self, setting: (&str, &str), change: impl FnOnce(&mut config::Device)) {
+    /// Saves what we learnt about the computer in use: its entry in the list of paired ones, and
+    /// `setting` (its hardware address or name) when there is one, in one write.
+    fn note_peer(&mut self, setting: Option<(&str, &str)>, change: impl FnOnce(&mut config::Device)) {
         let Some(key) = self.cfg.peer_key.clone() else { return };
         let saved = config::update(&self.cfg.path, |doc| {
-            doc.set(setting.0, Some(setting.1));
+            if let Some((name, value)) = setting {
+                doc.set(name, Some(value));
+            }
             config::change_device(doc, &key, change)
         });
         if let Err(e) = saved {
-            log!("{}: {e}", setting.0);
+            log!("saving what we know of the other computer: {e}");
         }
     }
 
@@ -572,12 +574,13 @@ impl Core {
                 if let Some(mac) = addr.and_then(wake::mac_of) {
                     self.cfg.peer_mac = Some(mac);
                 }
-                if let Some(mac) = self.cfg.peer_mac {
-                    self.note_peer(("peer_mac", &config::mac_text(&mac)), |d| {
-                        d.seen = now_ms();
-                        d.mac = Some(mac);
-                    });
-                }
+                // Every connection counts as seen; the hardware address only when it was found.
+                let mac = self.cfg.peer_mac;
+                let mac_text = mac.map(|m| config::mac_text(&m));
+                self.note_peer(mac_text.as_deref().map(|m| ("peer_mac", m)), |d| {
+                    d.seen = now_ms();
+                    d.mac = mac.or(d.mac);
+                });
                 self.show_status();
             }
             Input::Down => {
@@ -781,7 +784,7 @@ impl Core {
                 self.peer_receives = receive;
                 if self.cfg.peer_name.as_deref() != Some(name.as_str()) && !name.is_empty() {
                     let name = config::clean_name(&name);
-                    self.note_peer(("peer_name", &name), |d| d.name = name.clone());
+                    self.note_peer(Some(("peer_name", &name)), |d| d.name = name.clone());
                     self.cfg.peer_name = Some(name);
                 }
                 self.show_status();
