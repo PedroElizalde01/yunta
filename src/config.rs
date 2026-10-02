@@ -269,7 +269,8 @@ fn parse(path: PathBuf, text: &str) -> io::Result<Config> {
             "layout_at" => cfg.layout.stamp = v.parse().map_err(|_| err("expected milliseconds"))?,
             "resistance" => cfg.resistance = v.parse().ok().filter(|r| *r >= 0).ok_or_else(|| err("expected a number, 0 or more"))?,
             "hotkey" => cfg.hotkey = u16::from_str_radix(v.trim_start_matches("0x"), 16).map_err(|_| err("expected a HID usage in hex"))?,
-            _ => return Err(err("unknown setting")),
+            // From a newer version, most likely: skipped, so going back a version still starts.
+            _ => log!("{}:{}: skipping `{k}`, which this version does not know", cfg.path.display(), n + 1),
         }
     }
     // Paired before there was a list: the one paired is its first entry.
@@ -288,37 +289,56 @@ fn parse(path: PathBuf, text: &str) -> io::Result<Config> {
 /// Rewrites one setting in the file, keeping everything else. `Some` replaces the setting, or its
 /// commented-out example, or adds it at the end; `None` removes it.
 pub fn set(path: &Path, key: &str, value: Option<&str>) -> io::Result<()> {
-    let text = fs::read_to_string(path)?;
-    let mut out = String::new();
-    let mut written = value.is_none();
-    for line in text.lines() {
-        let live = !line.trim_start().starts_with('#');
-        let name = line.trim_start_matches(['#', ' ']).split('=').next().unwrap_or("").trim();
-        if name == key && line.contains('=') && (live || !written) {
-            if let (Some(v), false) = (value, written) {
-                out.push_str(&format!("{key} = {v}\n"));
-                written = true;
+    rewrite(path, |text| {
+        let mut out = String::new();
+        let mut written = value.is_none();
+        for line in text.lines() {
+            let live = !line.trim_start().starts_with('#');
+            let name = line.trim_start_matches(['#', ' ']).split('=').next().unwrap_or("").trim();
+            if name == key && line.contains('=') && (live || !written) {
+                if let (Some(v), false) = (value, written) {
+                    out.push_str(&format!("{key} = {v}\n"));
+                    written = true;
+                }
+                continue;
             }
-            continue;
+            out.push_str(line);
+            out.push('\n');
         }
-        out.push_str(line);
-        out.push('\n');
-    }
-    if !written && let Some(v) = value {
-        out.push_str(&format!("{key} = {v}\n"));
-    }
-    // Written in place, so the file keeps its owner-only permissions.
-    fs::write(path, out)
+        if !written && let Some(v) = value {
+            out.push_str(&format!("{key} = {v}\n"));
+        }
+        out
+    })
+}
+
+/// Changes yunta.conf while the app and the settings window may both be at it: one at a time,
+/// under a lock beside it, and by writing a new file and swapping it in, so nobody ever reads
+/// half a file and saves that back, losing the rest.
+fn rewrite(path: &Path, change: impl FnOnce(&str) -> String) -> io::Result<()> {
+    let lock = OpenOptions::new().create(true).truncate(false).write(true).open(path.with_file_name("yunta.conf.lock"))?;
+    lock.lock()?;
+    let out = change(&fs::read_to_string(path)?);
+    let aside = path.with_extension("conf.new");
+    let mut file = OpenOptions::new();
+    file.write(true).create(true).truncate(true);
+    // Private like the file it replaces: it holds this machine's key.
+    #[cfg(unix)]
+    std::os::unix::fs::OpenOptionsExt::mode(&mut file, 0o600);
+    file.open(&aside)?.write_all(out.as_bytes())?;
+    fs::rename(&aside, path)
 }
 
 /// Writes the list of paired computers, in place of the one there.
 pub fn save_devices(path: &Path, devices: &[Device]) -> io::Result<()> {
-    let text = fs::read_to_string(path)?;
-    let mut out: String = text.lines().filter(|l| l.split('=').next().unwrap_or("").trim() != "device").map(|l| format!("{l}\n")).collect();
-    for d in devices {
-        out.push_str(&format!("device = {}\n", d.line()));
-    }
-    fs::write(path, out)
+    rewrite(path, |text| {
+        let mut out: String =
+            text.lines().filter(|l| l.split('=').next().unwrap_or("").trim() != "device").map(|l| format!("{l}\n")).collect();
+        for d in devices {
+            out.push_str(&format!("device = {}\n", d.line()));
+        }
+        out
+    })
 }
 
 /// Adds `device` to the list, or updates its entry, and makes it the one in use.
@@ -428,7 +448,6 @@ mod tests {
         for bad in [
             "key = abc",
             "edge = up",
-            "nonsense = 1",
             "resistance = -1",
             "just words",
             "along = 0, 1, 0",
