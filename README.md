@@ -78,3 +78,8 @@ seconds to finish. Nothing leaves the local network.
   background process never runs that code (about 8MB of memory on Linux).
 - Windows ignores input sent into administrator windows (Task Manager, installers, UAC) unless
   yunta itself runs as administrator.
+
+## License
+
+MIT. See [LICENSE](LICENSE). The Inter typeface in `assets/` is under the SIL Open Font License
+(`assets/Inter-LICENSE.txt`).
