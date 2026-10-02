@@ -84,8 +84,8 @@ fn apply(deb: &Path) -> io::Result<()> {
 fn apply(exe: &Path) -> io::Result<()> {
     // A running program cannot be overwritten, but it can be renamed.
     let current = std::env::current_exe()?;
-    let old = current.with_extension("old.exe");
-    let _ = std::fs::remove_file(&old);
+    // A name of its own each time: an earlier one may still be running and cannot go yet.
+    let old = current.with_extension(format!("old-{}.exe", crate::now_ms()));
     std::fs::rename(&current, &old)?;
     if let Err(e) = std::fs::copy(exe, &current) {
         let _ = std::fs::rename(&old, &current);
@@ -94,10 +94,21 @@ fn apply(exe: &Path) -> io::Result<()> {
     Ok(())
 }
 
-/// Removes the copy a Windows update moved aside, once nothing runs from it.
+/// Removes the copies Windows updates moved aside (yunta.old-*.exe), once nothing runs from
+/// them; one still running stays until next time.
 pub fn tidy() {
-    if let Ok(exe) = std::env::current_exe() {
-        let _ = std::fs::remove_file(exe.with_extension("old.exe"));
+    if !cfg!(windows) {
+        return;
+    }
+    let Ok(exe) = std::env::current_exe() else { return };
+    let (Some(dir), Some(stem)) = (exe.parent(), exe.file_stem().and_then(|s| s.to_str())) else { return };
+    let prefix = format!("{stem}.old");
+    for entry in std::fs::read_dir(dir).into_iter().flatten().flatten() {
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        if name.starts_with(&prefix) && name.ends_with(".exe") {
+            let _ = std::fs::remove_file(entry.path());
+        }
     }
 }
 
