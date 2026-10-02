@@ -47,10 +47,21 @@ pub struct Receiver {
     buf: Vec<u8>,
 }
 
+/// Dials the peer, on the LAN only: an address that resolves off it is never tried, so traffic
+/// stays local even if the config is edited to point elsewhere.
 pub fn connect(addr: impl ToSocketAddrs, key: &[u8], peer: &[u8]) -> io::Result<(Sender, Receiver)> {
-    let addr = addr.to_socket_addrs()?.next().ok_or(io::ErrorKind::NotFound)?;
-    let stream = TcpStream::connect_timeout(&addr, HANDSHAKE_TIMEOUT)?;
-    handshake(stream, builder(key, peer)?.build_initiator().map_err(bad)?)
+    let local: Vec<_> = addr.to_socket_addrs()?.filter(|a| is_lan(a.ip())).collect();
+    if local.is_empty() {
+        return Err(io::Error::new(io::ErrorKind::PermissionDenied, "the other computer's address is not on the local network"));
+    }
+    let mut last = io::Error::from(io::ErrorKind::NotFound);
+    for addr in local {
+        match TcpStream::connect_timeout(&addr, HANDSHAKE_TIMEOUT) {
+            Ok(stream) => return handshake(stream, builder(key, peer)?.build_initiator().map_err(bad)?),
+            Err(e) => last = e,
+        }
+    }
+    Err(last)
 }
 
 /// Runs the responder side on a stream from `TcpListener::accept`. Refuses anything off the LAN.
@@ -193,6 +204,13 @@ fn bad(e: impl ToString) -> io::Error {
 mod tests {
     use super::*;
     use std::net::TcpListener;
+
+    #[test]
+    fn never_dials_off_the_lan() {
+        let k = keypair();
+        let e = connect("8.8.8.8:24830", &k.private, &k.public).err().unwrap();
+        assert_eq!(e.kind(), io::ErrorKind::PermissionDenied);
+    }
 
     #[test]
     fn paired_peers_talk_and_strangers_do_not() {
