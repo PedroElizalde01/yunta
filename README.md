@@ -42,11 +42,13 @@ for input and TCP and UDP 24831 while pairing.
 ## Build
 
 `./package.sh` builds `dist/yunta_<version>_amd64.deb`, and `dist/yunta.exe` as well once the
-Windows cross compiler is installed:
+Windows toolchain is installed. The `.exe` is built with Microsoft's compiler through cargo-xwin,
+which downloads the Windows SDK and C runtime and accepts Microsoft's license for them:
 
 ```
 sudo apt install mingw-w64
-rustup target add x86_64-pc-windows-gnu
+rustup target add x86_64-pc-windows-msvc
+cargo install --locked cargo-xwin
 ```
 
 `./release.sh` publishes a release: it tags the version in Cargo.toml, pushes, runs

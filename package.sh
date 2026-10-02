@@ -36,11 +36,15 @@ Description: One keyboard and mouse for two computers on the same network
 EOF
 dpkg-deb --root-owner-group --build "$root" "dist/yunta_${version}_amd64.deb"
 
-if command -v x86_64-w64-mingw32-gcc >/dev/null; then
-    cargo build --release --target x86_64-pc-windows-gnu
-    cp target/x86_64-pc-windows-gnu/release/yunta.exe dist/
+# yunta.exe is built with Microsoft's toolchain (MSVC), through cargo-xwin, which fetches the
+# Windows SDK and C runtime under Microsoft's license. Antivirus heuristics trust it more than a
+# mingw build. mingw's windres still compiles the icon and version resources (see build.rs).
+if command -v cargo-xwin >/dev/null && command -v x86_64-w64-mingw32-windres >/dev/null; then
+    XWIN_ACCEPT_LICENSE=1 cargo xwin build --release --target x86_64-pc-windows-msvc
+    cp target/x86_64-pc-windows-msvc/release/yunta.exe dist/
 else
-    echo "Skipping yunta.exe: install mingw-w64 to cross-compile it." >&2
+    echo "Skipping yunta.exe: needs cargo-xwin (cargo install --locked cargo-xwin;" >&2
+    echo "rustup target add x86_64-pc-windows-msvc) and mingw-w64 for windres." >&2
 fi
 
 # Signed checksums, which the app's one-click update insists on. The key stays on this machine.
