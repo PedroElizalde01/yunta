@@ -111,6 +111,11 @@ impl Os {
         pointer(&self.conn, self.root).map_or((0, 0), |p| (p.root_x.into(), p.root_y.into()))
     }
 
+    /// A jump to the entry point or back home. Warping is immediate on X11, as moving is.
+    pub fn place(&self, x: i32, y: i32) {
+        self.move_to(x, y);
+    }
+
     pub fn move_to(&self, x: i32, y: i32) {
         let _ = self.conn.warp_pointer(NONE, self.root, 0, 0, 0, 0, x as i16, y as i16);
         let _ = self.conn.flush();

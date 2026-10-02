@@ -61,6 +61,9 @@ pub enum Msg {
     /// An app fills the sender's screen: its edge is not to be crossed into, though the
     /// shortcut may still switch. Sent on link up and whenever that changes.
     Busy(bool),
+    /// The sender's own mouse moved while the receiver was driving it: the receiver stops
+    /// driving and puts its pointer back where it left, quietly.
+    TakeBack,
 }
 
 impl Msg {
@@ -122,6 +125,7 @@ impl Msg {
             }
             Msg::Gesture { fingers, direction } => out.extend_from_slice(&[12, *fingers, *direction]),
             Msg::Busy(busy) => out.extend_from_slice(&[13, *busy as u8]),
+            Msg::TakeBack => out.push(14),
         }
         out
     }
@@ -171,6 +175,7 @@ impl Msg {
             }
             12 if *r.get(1)? < 4 => (Msg::Gesture { fingers: *r.first()?, direction: r[1] }, 2),
             13 => (Msg::Busy(bool_at(0)?), 1),
+            14 => (Msg::TakeBack, 0),
             _ => return None,
         };
         (len == r.len()).then_some(msg)
@@ -200,6 +205,7 @@ mod tests {
             Msg::Hello { receive: false, name: "Pedro's laptop".into() },
             Msg::Gesture { fingers: 3, direction: 1 },
             Msg::Busy(true),
+            Msg::TakeBack,
         ];
         for m in all {
             assert_eq!(Msg::decode(&m.encode()), Some(m));

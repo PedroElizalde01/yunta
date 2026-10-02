@@ -33,14 +33,14 @@ use windows_sys::Win32::UI::Shell::{NIF_ICON, NIF_MESSAGE, NIF_TIP, NIM_ADD, NIM
 use windows_sys::Win32::UI::WindowsAndMessaging::{
     AppendMenuW, CallNextHookEx, CreateCursor, CreateIcon, CreatePopupMenu, CreateWindowExW, DefWindowProcW, DestroyIcon, DestroyMenu,
     DispatchMessageW, GetClassNameW, GetCursorPos, GetDesktopWindow, GetForegroundWindow, GetMessageW, GetShellWindow, GetSystemMetrics,
-    GetWindowRect, HICON, KBDLLHOOKSTRUCT, LLKHF_EXTENDED, LLKHF_INJECTED, LLMHF_INJECTED, MF_CHECKED, MF_GRAYED, MF_SEPARATOR, MF_STRING,
-    MSG, MSLLHOOKSTRUCT, OCR_APPSTARTING, OCR_CROSS, OCR_HAND, OCR_HELP, OCR_IBEAM, OCR_NO, OCR_NORMAL, OCR_SIZEALL, OCR_SIZENESW,
-    OCR_SIZENS, OCR_SIZENWSE, OCR_SIZEWE, OCR_UP, OCR_WAIT, PM_REMOVE, PeekMessageW, PostMessageW, RegisterClassW, SM_CXSCREEN,
-    SM_CXVIRTUALSCREEN, SM_CYSCREEN, SM_CYVIRTUALSCREEN, SM_XVIRTUALSCREEN, SM_YVIRTUALSCREEN, SPI_SETCURSORS, SW_HIDE, SW_SHOWNOACTIVATE,
-    SetCursorPos, SetForegroundWindow, SetSystemCursor, SetWindowsHookExW, ShowWindow, SystemParametersInfoW, TPM_NONOTIFY, TPM_RETURNCMD,
-    TPM_RIGHTBUTTON, TrackPopupMenu, ULW_ALPHA, UpdateLayeredWindow, WH_KEYBOARD_LL, WH_MOUSE_LL, WM_APP, WM_INPUT, WM_KEYDOWN,
-    WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MBUTTONDOWN, WM_MBUTTONUP, WM_MOUSEHWHEEL, WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_RBUTTONDOWN, WM_RBUTTONUP,
-    WM_SYSKEYDOWN, WM_XBUTTONDOWN, WM_XBUTTONUP, WNDCLASSW, WS_EX_LAYERED, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_EX_TOPMOST,
+    GetWindowRect, HICON, HWND_TOPMOST, KBDLLHOOKSTRUCT, LLKHF_EXTENDED, LLKHF_INJECTED, LLMHF_INJECTED, LWA_ALPHA, MF_CHECKED, MF_GRAYED,
+    MF_SEPARATOR, MF_STRING, MSG, MSLLHOOKSTRUCT, PM_REMOVE, PeekMessageW, PostMessageW, RegisterClassW, SM_CXCURSOR, SM_CXSCREEN,
+    SM_CXVIRTUALSCREEN, SM_CYCURSOR, SM_CYSCREEN, SM_CYVIRTUALSCREEN, SM_XVIRTUALSCREEN, SM_YVIRTUALSCREEN, SPI_SETCURSORS, SW_HIDE,
+    SW_SHOWNOACTIVATE, SWP_HIDEWINDOW, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SWP_NOZORDER, SWP_SHOWWINDOW, SetCursor, SetCursorPos,
+    SetForegroundWindow, SetLayeredWindowAttributes, SetWindowPos, SetWindowsHookExW, ShowWindow, SystemParametersInfoW, TPM_NONOTIFY,
+    TPM_RETURNCMD, TPM_RIGHTBUTTON, TrackPopupMenu, ULW_ALPHA, UpdateLayeredWindow, WH_KEYBOARD_LL, WH_MOUSE_LL, WM_APP, WM_INPUT,
+    WM_KEYDOWN, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MBUTTONDOWN, WM_MBUTTONUP, WM_MOUSEHWHEEL, WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_RBUTTONDOWN,
+    WM_RBUTTONUP, WM_SYSKEYDOWN, WM_XBUTTONDOWN, WM_XBUTTONUP, WNDCLASSW, WS_EX_LAYERED, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_EX_TOPMOST,
     WS_EX_TRANSPARENT, WS_POPUP, XBUTTON1, XBUTTON2,
 };
 use windows_sys::core::BOOL;
@@ -66,6 +66,10 @@ static TRAY: Mutex<(Look, String)> = Mutex::new((Look::Waiting, String::new()));
 
 const WM_TRAY_CLICK: u32 = WM_APP + 1;
 const WM_TRAY_SHOW: u32 = WM_APP + 2;
+const WM_HIDE_POINTER: u32 = WM_APP + 3;
+const WM_SHOW_POINTER: u32 = WM_APP + 4;
+static HIDER: AtomicPtr<c_void> = AtomicPtr::new(ptr::null_mut());
+static BLANK: AtomicPtr<c_void> = AtomicPtr::new(ptr::null_mut());
 
 /// Output goes to the terminal that started us, if any. Nothing appears otherwise.
 pub fn attach_console() {
@@ -107,7 +111,7 @@ impl Os {
         // Physical pixels on every monitor, whatever its scaling, so positions line up.
         unsafe { SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2) };
         // A crash while driving leaves the cursors blank (panic aborts, nothing cleans up).
-        hide_cursors(false);
+        restore_cursors();
         EVENTS.set(tx).map_err(|_| io::Error::other("input capture started twice"))?;
         let (ready_tx, ready) = mpsc::channel();
         std::thread::spawn(move || {
@@ -163,9 +167,17 @@ impl Os {
             unsafe { SetCursorPos(x, y) };
         }
         if GRABBED.swap(on, Ordering::Relaxed) != on {
-            hide_cursors(on);
+            // The hider belongs to the input thread, so it is moved there.
+            let message = if on { WM_HIDE_POINTER } else { WM_SHOW_POINTER };
+            unsafe { PostMessageW(WINDOW.load(Ordering::Relaxed), message, 0, 0) };
         }
         true
+    }
+
+    /// Puts the pointer at (x, y) at once. SendInput lands a moment later, so a jump to the
+    /// entry point or back home would show the pointer where it was first.
+    pub fn place(&self, x: i32, y: i32) {
+        unsafe { SetCursorPos(x, y) };
     }
 
     /// The keys and buttons that stay here while driving: the hooks let them through.
@@ -333,35 +345,58 @@ impl Overlay {
     }
 }
 
-/// Blanks every system cursor, so the parked one disappears while the peer has input, or puts
-/// the user's cursor scheme back. Session-wide: it outlives us if we die blanked.
-fn hide_cursors(hide: bool) {
-    if !hide {
-        unsafe { SystemParametersInfoW(SPI_SETCURSORS, 0, ptr::null_mut(), 0) };
+/// Puts the user's cursor scheme back. Versions before 0.1.3 blanked the system cursors while
+/// driving, and a crash then left them blank; this repairs that on start.
+fn restore_cursors() {
+    unsafe { SystemParametersInfoW(SPI_SETCURSORS, 0, ptr::null_mut(), 0) };
+}
+
+/// The hider: a window one pixel square with a blank cursor, put under the parked cursor while
+/// this PC drives the peer. The cursor shape comes from the window under it, so it vanishes
+/// whatever app is behind, including ones with cursors of their own. Input Leap does the same.
+/// Made on the input thread, which owns it.
+fn make_hider(module: windows_sys::Win32::Foundation::HINSTANCE) -> HWND {
+    unsafe {
+        let (w, h) = (GetSystemMetrics(SM_CXCURSOR).max(1), GetSystemMetrics(SM_CYCURSOR).max(1));
+        // Monochrome: an AND mask of ones and an XOR mask of zeros is see-through everywhere.
+        let bytes = (h * ((w + 15) / 16) * 2) as usize;
+        let (and, xor) = (vec![0xFFu8; bytes], vec![0u8; bytes]);
+        let blank = CreateCursor(module, 0, 0, w, h, and.as_ptr().cast(), xor.as_ptr().cast());
+        BLANK.store(blank, Ordering::Relaxed);
+        let class: Vec<u16> = "yunta-hider\0".encode_utf16().collect();
+        let wc = WNDCLASSW {
+            lpfnWndProc: Some(DefWindowProcW),
+            hInstance: module,
+            lpszClassName: class.as_ptr(),
+            hCursor: blank,
+            ..mem::zeroed()
+        };
+        RegisterClassW(&wc);
+        // Layered at the lowest alpha: nothing to see, yet still under the pointer for hit tests.
+        let ex = WS_EX_LAYERED | WS_EX_TOPMOST | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE;
+        let hider =
+            CreateWindowExW(ex, class.as_ptr(), ptr::null(), WS_POPUP, 0, 0, 1, 1, ptr::null_mut(), ptr::null_mut(), module, ptr::null());
+        if !hider.is_null() {
+            SetLayeredWindowAttributes(hider, 0, 1, LWA_ALPHA);
+        }
+        hider
+    }
+}
+
+/// Shows the hider under the parked cursor, or takes it away. Runs on the input thread.
+fn hide_pointer(hide: bool) {
+    let hider = HIDER.load(Ordering::Relaxed);
+    if hider.is_null() {
         return;
     }
-    // 32x32 monochrome: an AND mask of ones and an XOR mask of zeros is see-through everywhere.
-    let (and, xor) = ([0xFFu8; 128], [0u8; 128]);
-    for id in [
-        OCR_NORMAL,
-        OCR_IBEAM,
-        OCR_WAIT,
-        OCR_CROSS,
-        OCR_UP,
-        OCR_SIZENWSE,
-        OCR_SIZENESW,
-        OCR_SIZEWE,
-        OCR_SIZENS,
-        OCR_SIZEALL,
-        OCR_NO,
-        OCR_HAND,
-        OCR_APPSTARTING,
-        OCR_HELP,
-    ] {
-        // SetSystemCursor takes the cursor over, so each id gets one of its own.
-        unsafe {
-            let blank = CreateCursor(GetModuleHandleW(ptr::null()), 0, 0, 32, 32, and.as_ptr().cast(), xor.as_ptr().cast());
-            SetSystemCursor(blank, id);
+    unsafe {
+        if hide {
+            let (x, y) = (PARK.0.load(Ordering::Relaxed), PARK.1.load(Ordering::Relaxed));
+            SetWindowPos(hider, HWND_TOPMOST, x, y, 1, 1, SWP_NOACTIVATE | SWP_SHOWWINDOW);
+            // The shape otherwise changes only on the next move, which the hook swallows.
+            SetCursor(BLANK.load(Ordering::Relaxed));
+        } else {
+            SetWindowPos(hider, ptr::null_mut(), 0, 0, 0, 0, SWP_HIDEWINDOW | SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE);
         }
     }
 }
@@ -403,6 +438,7 @@ fn install() -> io::Result<()> {
             return Err(fail("CreateWindowExW"));
         }
         WINDOW.store(hwnd, Ordering::Relaxed);
+        HIDER.store(make_hider(module), Ordering::Relaxed);
         // Generic desktop mouse, delivered even while another window has focus.
         let mouse = RAWINPUTDEVICE { usUsagePage: 1, usUsage: 2, dwFlags: RIDEV_INPUTSINK, hwndTarget: hwnd };
         if RegisterRawInputDevices(&mouse, 1, mem::size_of::<RAWINPUTDEVICE>() as u32) == 0 {
@@ -428,6 +464,8 @@ fn emit(event: Event) {
 unsafe extern "system" fn window_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
     match msg {
         WM_TRAY_SHOW => show_tray(hwnd),
+        WM_HIDE_POINTER => hide_pointer(true),
+        WM_SHOW_POINTER => hide_pointer(false),
         // A click opens the settings, as tray icons do on Windows; a right click the menu.
         WM_TRAY_CLICK if lparam as u32 == WM_LBUTTONUP => crate::open_settings(None),
         WM_TRAY_CLICK if lparam as u32 == WM_RBUTTONUP => tray_menu(hwnd),

@@ -36,6 +36,8 @@ use msg::Msg;
 
 /// Set on the copy a restart starts.
 pub const RESTART: &str = "YUNTA_RESTART";
+/// How far, in pixels, our own mouse moves while driven before this computer takes itself back.
+const TAKE_BACK: i32 = 6;
 /// The core wakes at least this often, to ping, poll and pick up config changes.
 const TICK: Duration = Duration::from_millis(250);
 /// How long the tray and window say a wake-up is under way.
@@ -295,6 +297,8 @@ struct Core {
     /// While driven, where we put the pointer. Kept here rather than read back: on Windows a
     /// move is applied later, and reading the position at once can give the old one.
     pointer: (i32, i32),
+    /// While driven: when our own mouse started moving, and how far it has gone since.
+    moved: (Instant, i32),
     /// An app fills the peer's screen, so its edge is not crossed into.
     peer_busy: bool,
     /// What we last told the peer about our own full-screen app.
@@ -330,6 +334,7 @@ impl Core {
             rest: (0.0, 0.0),
             woke_at: None,
             pointer: (0, 0),
+            moved: (now, 0),
             peer_busy: false,
             busy: false,
             cfg,
@@ -562,6 +567,9 @@ impl Core {
         match event {
             Event::Motion { x, y, dx, dy, dragging } => match self.state {
                 State::Driving => self.send(Msg::Move { dx: clamp16(dx), dy: clamp16(dy) }),
+                // Our moves while driven are warps (X11) or marked as ours (Windows), so motion
+                // seen here is this computer's own mouse.
+                State::Driven => self.take_back(dx, dy),
                 // The edge stays shut while an app fills the peer's screen: no glow, and the
                 // pointer stays here. The shortcut still switches.
                 State::Local if !self.cfg.paused && self.can_drive() && !(self.link.is_some() && self.peer_busy) => {
@@ -670,7 +678,7 @@ impl Core {
                 self.back = Crossing::new(edge, self.cfg.resistance);
                 self.rest = (0.0, 0.0);
                 self.pointer = crossing::entry_point(&self.displays, edge, pos).unwrap_or_else(|| self.os.cursor());
-                self.os.move_to(self.pointer.0, self.pointer.1);
+                self.os.place(self.pointer.0, self.pointer.1);
                 self.arrive(self.pointer.0, self.pointer.1);
                 self.state = State::Driven;
             }
@@ -730,6 +738,7 @@ impl Core {
                 self.show_status();
             }
             Msg::Busy(busy) => self.peer_busy = busy,
+            Msg::TakeBack if self.state == State::Driving => self.come_home_to(None, false),
             Msg::Displays(displays) => self.peer_displays = displays,
             Msg::Layout(theirs) => {
                 // The newer arrangement wins. A tie, as when neither was ever set, goes to the
@@ -775,14 +784,37 @@ impl Core {
     /// Stops driving. With `pos` the pointer comes back through our edge there, otherwise to
     /// where it left.
     fn come_home(&mut self, pos: Option<u16>) {
+        self.come_home_to(pos, true);
+    }
+
+    /// As `come_home`, with the landing ripple only when `show`.
+    fn come_home_to(&mut self, pos: Option<u16>, show: bool) {
         for up in release(&mut self.held_there) {
             self.send(up);
         }
-        self.os.grab(false);
         let (x, y) = pos.and_then(|p| crossing::entry_point(&self.displays, self.cfg.layout.edge, p)).unwrap_or(self.exit);
-        self.os.move_to(x, y);
-        self.arrive(x, y);
+        // Placed before letting go, so the pointer never shows where it was parked.
+        self.os.place(x, y);
+        self.os.grab(false);
+        if show {
+            self.arrive(x, y);
+        }
         self.state = State::Local;
+    }
+
+    /// While driven, our own mouse moved: whoever sits here wants this computer back. A few
+    /// pixels within a moment count, so a nudged desk does not.
+    fn take_back(&mut self, dx: i32, dy: i32) {
+        if self.moved.0.elapsed() > Duration::from_millis(300) {
+            self.moved = (Instant::now(), 0);
+        }
+        self.moved.1 += dx.abs() + dy.abs();
+        if self.moved.1 >= TAKE_BACK {
+            eprintln!("this computer's own mouse moved: taking it back");
+            self.moved.1 = 0;
+            self.let_go();
+            self.send(Msg::TakeBack);
+        }
     }
 
     /// Whether an app fills the screen here, asked at most a few times a second.
