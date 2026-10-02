@@ -1,6 +1,6 @@
 //! Windows backend. Low-level hooks see keys, buttons and the wheel, and swallow all of it while
-//! this PC drives the peer. Raw Input measures how far the mouse moved: a hook reports the cursor
-//! already clamped to the desktop, so a push against the edge would never register there.
+//! this PC drives the peer. Raw Input measures how far the mouse moved, always: a hook reports the
+//! cursor clamped to the desktop, and a move it was too slow to stop shifts every later one.
 //! SendInput plays the peer's input. The tray icon lives on the same thread and window.
 
 use std::ffi::c_void;
@@ -58,11 +58,11 @@ static EVENTS: OnceLock<mpsc::Sender<Input>> = OnceLock::new();
 static GRABBED: AtomicBool = AtomicBool::new(false);
 /// While grabbed: mouse moves the hook saw, and how many of them had not moved from the park.
 static HOOK_MOVES: AtomicU32 = AtomicU32::new(0);
-static HOOK_STILL: AtomicU32 = AtomicU32::new(0);
+static HOOK_DRIFT: AtomicU32 = AtomicU32::new(0);
 /// Keys and mouse buttons that reach Windows even while grabbed: they stay on this PC.
 static KEPT: Mutex<(Vec<u16>, Vec<u8>)> = Mutex::new((Vec::new(), Vec::new()));
-/// While grabbed the cursor is parked here, and each swallowed move is measured from it. That
-/// keeps Windows' pointer acceleration, which Raw Input's counts do not have.
+/// While grabbed the cursor is parked here, on the hider. Moves are measured by Raw Input, as
+/// Beamer does: a position measured from here drifts as soon as one move gets past the hook.
 static PARK: (AtomicI32, AtomicI32) = (AtomicI32::new(0), AtomicI32::new(0));
 static WINDOW: AtomicPtr<c_void> = AtomicPtr::new(ptr::null_mut());
 static TRAY: Mutex<(Look, String)> = Mutex::new((Look::Waiting, String::new()));
@@ -183,9 +183,10 @@ impl Os {
         GRABBED.load(Ordering::Relaxed)
     }
 
-    /// Mouse moves the hook saw while grabbed, and how many stood still, since last asked.
+    /// Mouse moves the hook swallowed while grabbed, and how many found the cursor off the park
+    /// and put it back, since last asked.
     pub fn hook_stats(&self) -> (u32, u32) {
-        (HOOK_MOVES.swap(0, Ordering::Relaxed), HOOK_STILL.swap(0, Ordering::Relaxed))
+        (HOOK_MOVES.swap(0, Ordering::Relaxed), HOOK_DRIFT.swap(0, Ordering::Relaxed))
     }
 
     /// Puts the pointer at (x, y) at once. SendInput lands a moment later, so a jump to the
@@ -476,7 +477,7 @@ fn emit(event: Event) {
     }
 }
 
-/// Pointer motion while not grabbed, for pushing against the edge, and the tray icon.
+/// Pointer motion, measured by Raw Input whether grabbed or not, and the tray icon.
 unsafe extern "system" fn window_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
     match msg {
         WM_TRAY_SHOW => show_tray(hwnd),
@@ -491,9 +492,12 @@ unsafe extern "system" fn window_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lpar
         _ => {}
     }
     if msg == WM_INPUT
-        && !GRABBED.load(Ordering::Relaxed)
         && let Some((dx, dy)) = raw_motion(lparam)
     {
+        if GRABBED.load(Ordering::Relaxed) {
+            emit(Event::Motion { x: 0, y: 0, dx, dy, dragging: false, grabbed: true });
+            return unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) };
+        }
         let mut p = POINT { x: 0, y: 0 };
         let held = |vk: u16| unsafe { GetAsyncKeyState(vk as i32) } < 0;
         unsafe { GetCursorPos(&mut p) };
@@ -559,13 +563,17 @@ unsafe extern "system" fn mouse_proc(code: i32, wparam: WPARAM, lparam: LPARAM) 
             let msg = wparam as u32;
             let down = matches!(msg, WM_LBUTTONDOWN | WM_RBUTTONDOWN | WM_MBUTTONDOWN | WM_XBUTTONDOWN);
             let event = match msg {
+                // Raw Input measures the move (window_proc); here it is only swallowed. A move
+                // the hook was too slow to stop still moved the cursor, so it goes back on the
+                // hider, as Beamer puts it back on its pin.
                 WM_MOUSEMOVE => {
-                    let (dx, dy) = (m.pt.x - PARK.0.load(Ordering::Relaxed), m.pt.y - PARK.1.load(Ordering::Relaxed));
                     HOOK_MOVES.fetch_add(1, Ordering::Relaxed);
-                    if dx == 0 && dy == 0 {
-                        HOOK_STILL.fetch_add(1, Ordering::Relaxed);
+                    let (mut p, park) = (POINT { x: 0, y: 0 }, (PARK.0.load(Ordering::Relaxed), PARK.1.load(Ordering::Relaxed)));
+                    if unsafe { GetCursorPos(&mut p) } != 0 && (p.x, p.y) != park {
+                        HOOK_DRIFT.fetch_add(1, Ordering::Relaxed);
+                        unsafe { SetCursorPos(park.0, park.1) };
                     }
-                    (dx != 0 || dy != 0).then_some(Event::Motion { x: 0, y: 0, dx, dy, dragging: false, grabbed: true })
+                    None
                 }
                 WM_LBUTTONDOWN | WM_LBUTTONUP => Some(Event::Button { button: 1, down }),
                 WM_RBUTTONDOWN | WM_RBUTTONUP => Some(Event::Button { button: 2, down }),

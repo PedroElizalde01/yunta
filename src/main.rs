@@ -426,9 +426,9 @@ impl Core {
         if self.state == State::Local || self.reported.elapsed() < Duration::from_secs(1) {
             return;
         }
-        let (seen, still) = self.os.hook_stats();
+        let (seen, drift) = self.os.hook_stats();
         match self.state {
-            State::Driving => log!("driving: {} moves sent; the mouse hook saw {seen} moves, {still} of them standing still", self.moves),
+            State::Driving => log!("driving: {} moves sent; the mouse hook swallowed {seen}, {drift} of them off the park", self.moves),
             _ => log!("driven: {} moves taken in, pointer at {:?}", self.moves, self.pointer),
         }
         (self.moves, self.reported) = (0, Instant::now());
