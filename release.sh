@@ -12,22 +12,32 @@ if [ -n "$(git status --porcelain --untracked-files=no)" ]; then
     echo "Commit or stash your changes first: a release is built from a clean tree." >&2
     exit 1
 fi
+tagged=no
 if git rev-parse -q --verify "refs/tags/$tag" >/dev/null; then
     # The tag may sit on an earlier commit, as long as nothing that goes into the build changed.
     if ! git diff --quiet "$tag" HEAD -- src assets build.rs .cargo Cargo.toml Cargo.lock package.sh; then
         echo "$tag exists and the code changed since: raise the version in Cargo.toml." >&2
         exit 1
     fi
-else
-    git tag -a "$tag" -m "Yunta $version"
+    tagged=yes
 fi
-git push origin HEAD "$tag"
 
+# Everything is built, tested, signed and checked before anything is published, so a failure
+# here leaves no tag or release behind.
+cargo test --release
 ./package.sh
+key=${YUNTA_SIGNING_KEY:-$HOME/.config/yunta-release/signing.pem}
 if [ ! -f dist/SHA256SUMS.sig ]; then
     echo "dist/ is not signed, so the app would refuse it as an update: not releasing." >&2
     exit 1
 fi
+(cd dist && sha256sum --quiet -c SHA256SUMS)
+openssl pkey -in "$key" -pubout | openssl pkeyutl -verify -pubin -inkey /dev/stdin -rawin -in dist/SHA256SUMS -sigfile dist/SHA256SUMS.sig
+
+if [ "$tagged" = no ]; then
+    git tag -a "$tag" -m "Yunta $version"
+fi
+git push origin HEAD "$tag"
 
 # A token for this repo alone, if there is one; gh's own login otherwise.
 token=$HOME/.config/yunta-release/gh-token
