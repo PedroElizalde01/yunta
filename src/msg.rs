@@ -58,6 +58,9 @@ pub enum Msg {
         fingers: u8,
         direction: u8,
     },
+    /// An app fills the sender's screen: its edge is not to be crossed into, though the
+    /// shortcut may still switch. Sent on link up and whenever that changes.
+    Busy(bool),
 }
 
 impl Msg {
@@ -118,6 +121,7 @@ impl Msg {
                 out.extend_from_slice(name.as_bytes());
             }
             Msg::Gesture { fingers, direction } => out.extend_from_slice(&[12, *fingers, *direction]),
+            Msg::Busy(busy) => out.extend_from_slice(&[13, *busy as u8]),
         }
         out
     }
@@ -166,6 +170,7 @@ impl Msg {
                 (Msg::Hello { receive: bool_at(0)?, name }, r.len())
             }
             12 if *r.get(1)? < 4 => (Msg::Gesture { fingers: *r.first()?, direction: r[1] }, 2),
+            13 => (Msg::Busy(bool_at(0)?), 1),
             _ => return None,
         };
         (len == r.len()).then_some(msg)
@@ -194,6 +199,7 @@ mod tests {
             Msg::Layout(Layout { edge: Edge::Left, ours: (0, 0), theirs: (65535, 65535), stamp: 1, corner: true }),
             Msg::Hello { receive: false, name: "Pedro's laptop".into() },
             Msg::Gesture { fingers: 3, direction: 1 },
+            Msg::Busy(true),
         ];
         for m in all {
             assert_eq!(Msg::decode(&m.encode()), Some(m));

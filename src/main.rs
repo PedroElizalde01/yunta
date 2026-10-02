@@ -295,6 +295,10 @@ struct Core {
     /// While driven, where we put the pointer. Kept here rather than read back: on Windows a
     /// move is applied later, and reading the position at once can give the old one.
     pointer: (i32, i32),
+    /// An app fills the peer's screen, so its edge is not crossed into.
+    peer_busy: bool,
+    /// What we last told the peer about our own full-screen app.
+    busy: bool,
 }
 
 impl Core {
@@ -326,6 +330,8 @@ impl Core {
             rest: (0.0, 0.0),
             woke_at: None,
             pointer: (0, 0),
+            peer_busy: false,
+            busy: false,
             cfg,
         };
         core.apply_keep();
@@ -352,6 +358,12 @@ impl Core {
             }
             if self.tap.tick(self.now()) {
                 self.switch();
+            }
+            // While an app fills our screen, the peer is told not to cross into it.
+            let busy = self.link.is_some() && self.cfg.fullscreen && self.fullscreen();
+            if busy != self.busy {
+                self.busy = busy;
+                self.send(Msg::Busy(busy));
             }
             if self.last_send.elapsed() >= PING_EVERY {
                 self.send(Msg::Ping);
@@ -470,11 +482,12 @@ impl Core {
         };
         let yes = |b: bool| if b { "yes" } else { "no" };
         let status = format!(
-            "linked = {}\ninput = {input}\npaused = {}\nwaking = {}\npeer_receives = {}\ndisplays = {}\npeer_displays = {}\n",
+            "linked = {}\ninput = {input}\npaused = {}\nwaking = {}\npeer_receives = {}\npeer_busy = {}\ndisplays = {}\npeer_displays = {}\n",
             yes(self.link.is_some()),
             yes(self.cfg.paused),
             yes(self.waking()),
             yes(self.peer_receives),
+            yes(self.peer_busy),
             Rect::list_text(&self.displays),
             Rect::list_text(&self.peer_displays)
         );
@@ -501,6 +514,8 @@ impl Core {
                 self.send(Msg::Displays(self.displays.clone()));
                 self.send(Msg::Layout(self.cfg.layout));
                 self.hello();
+                self.busy = self.cfg.fullscreen && self.fullscreen();
+                self.send(Msg::Busy(self.busy));
                 // Fresh in the ARP table now, so this is the time to learn it for waking later.
                 if let Some(mac) = addr.and_then(wake::mac_of)
                     && self.cfg.peer_mac != Some(mac)
@@ -520,6 +535,7 @@ impl Core {
             Input::Down => {
                 self.link = None;
                 self.peer_receives = true;
+                self.peer_busy = false;
                 self.fall_back();
                 self.show_status();
             }
@@ -546,13 +562,23 @@ impl Core {
         match event {
             Event::Motion { x, y, dx, dy, dragging } => match self.state {
                 State::Driving => self.send(Msg::Move { dx: clamp16(dx), dy: clamp16(dy) }),
-                State::Local if !self.cfg.paused && self.can_drive() => {
+                // The edge stays shut while an app fills the peer's screen: no glow, and the
+                // pointer stays here. The shortcut still switches.
+                State::Local if !self.cfg.paused && self.can_drive() && !(self.link.is_some() && self.peer_busy) => {
                     if let Some(pos) = self.push(false, x, y, dx, dy, dragging) {
                         if self.link.is_some() {
                             self.drive(self.cfg.layout.to_peer(pos));
                         } else {
                             self.wake();
                         }
+                    }
+                }
+                // Shut while a glow was building: let it fade rather than hang there.
+                State::Local if self.glowing => {
+                    self.glowing = false;
+                    self.out.reset();
+                    if let Some(fx) = &self.fx {
+                        fx.push(self.out.edge, x, y, 0.0);
                     }
                 }
                 _ => {}
@@ -703,6 +729,7 @@ impl Core {
                 }
                 self.show_status();
             }
+            Msg::Busy(busy) => self.peer_busy = busy,
             Msg::Displays(displays) => self.peer_displays = displays,
             Msg::Layout(theirs) => {
                 // The newer arrangement wins. A tie, as when neither was ever set, goes to the

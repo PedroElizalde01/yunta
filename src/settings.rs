@@ -119,6 +119,8 @@ struct Status {
     waking: bool,
     /// The other computer lets this one's keyboard and mouse in.
     peer_receives: bool,
+    /// An app fills the other computer's screen.
+    peer_busy: bool,
     displays: Vec<Screen>,
     peer_displays: Vec<Screen>,
 }
@@ -133,6 +135,7 @@ impl Status {
                 "input" => s.input = v.to_string(),
                 "waking" => s.waking = v == "yes",
                 "peer_receives" => s.peer_receives = v == "yes",
+                "peer_busy" => s.peer_busy = v == "yes",
                 "displays" => s.displays = Screen::parse_list(v),
                 "peer_displays" => s.peer_displays = Screen::parse_list(v),
                 _ => {}
@@ -398,7 +401,12 @@ impl App {
                     _ => "The keyboard and mouse are on this computer.".to_string(),
                 };
                 let paused = if link == Link::Paused { " Crossing at the edge is paused; the shortcut still switches." } else { "" };
-                (format!("Connected to {peer}"), where_ + paused)
+                let busy = if self.status.peer_busy && link == Link::Connected {
+                    format!(" An app fills {peer}'s screen, so its edge waits; the shortcut still switches.")
+                } else {
+                    String::new()
+                };
+                (format!("Connected to {peer}"), where_ + paused + &busy)
             }
         };
         let can_wake = self.cfg.peer_mac.is_some();
