@@ -176,6 +176,8 @@ struct App {
     quit: bool,
     /// The paired computer whose Forget is waiting for a second click.
     forgetting: Option<Vec<u8>>,
+    /// When Forget was first pressed.
+    forget_asked: Instant,
 }
 
 /// Pairing mode in the window: the machines it found, and what was typed for each.
@@ -219,6 +221,7 @@ impl App {
             opened: std::time::SystemTime::now(),
             quit: false,
             forgetting: None,
+            forget_asked: Instant::now(),
         };
         app.refresh();
         if app.cfg.updates {
@@ -783,7 +786,7 @@ impl App {
             Forget(config::Device),
         }
         let mut act = None;
-        let (in_use, asking) = (self.cfg.peer_key.clone(), self.forgetting.clone());
+        let (in_use, asking, asked_at) = (self.cfg.peer_key.clone(), self.forgetting.clone(), self.forget_asked);
         // The one in use first, then the most recently connected.
         let mut devices = self.cfg.devices.clone();
         devices.sort_by_key(|d| (in_use.as_ref() != Some(&d.key), std::cmp::Reverse(d.seen)));
@@ -807,11 +810,18 @@ impl App {
                     });
                     ui.with_layout(Flow::right_to_left(Align::Center), |ui| {
                         if confirming {
-                            if ui.add(egui::Button::new(RichText::new("Forget").color(Color32::WHITE)).fill(p.danger)).clicked() {
-                                act = Some(Act::Forget(d.clone()));
-                            }
+                            // Cancel takes the place Forget was in, and the real Forget waits
+                            // half a second, so a double-click cannot forget by accident.
                             if ui.button("Cancel").clicked() {
                                 act = Some(Act::Cancel);
+                            }
+                            let ready = asked_at.elapsed() >= Duration::from_millis(500);
+                            let forget = egui::Button::new(RichText::new("Forget for good").color(Color32::WHITE)).fill(p.danger);
+                            if ui.add_enabled(ready, forget).clicked() {
+                                act = Some(Act::Forget(d.clone()));
+                            }
+                            if !ready {
+                                ui.ctx().request_repaint_after(Duration::from_millis(100));
                             }
                         } else {
                             if ui.button("Forget").clicked() {
@@ -835,7 +845,10 @@ impl App {
         let path = self.cfg.path.clone();
         let done = match act {
             None => return,
-            Some(Act::Ask(key)) => return self.forgetting = Some(key),
+            Some(Act::Ask(key)) => {
+                self.forget_asked = Instant::now();
+                return self.forgetting = Some(key);
+            }
             Some(Act::Cancel) => return self.forgetting = None,
             Some(Act::Use(d)) => config::use_device(&path, &self.cfg, d.clone()).map(|()| format!("Now using {}.", d.name)),
             Some(Act::Forget(d)) => config::forget_device(&path, &self.cfg, &d.key).map(|()| format!("Forgot {}.", d.name)),
