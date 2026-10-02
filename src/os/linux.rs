@@ -13,6 +13,7 @@ use std::sync::{Arc, mpsc};
 use x11rb::connection::Connection;
 use x11rb::protocol::Event as XEvent;
 use x11rb::protocol::randr::ConnectionExt as _;
+use x11rb::protocol::xfixes::ConnectionExt as _;
 use x11rb::protocol::xinput::{self, ConnectionExt as _};
 use x11rb::protocol::xkb::{self, ConnectionExt as _};
 use x11rb::protocol::xproto::{self, ConnectionExt as _, GrabMode, GrabStatus};
@@ -33,6 +34,8 @@ pub struct Os {
     root: u32,
     blank: u32,
     grabbed: Arc<AtomicBool>,
+    /// The pointer is hidden where it stands until this computer's own mouse moves it.
+    concealed: Arc<AtomicBool>,
     /// Scrolling not yet a whole wheel notch, since X only knows notches.
     scroll: Cell<(i32, i32)>,
     /// _NET_ACTIVE_WINDOW, _NET_WM_STATE and _NET_WM_STATE_FULLSCREEN, for spotting a full-screen app.
@@ -50,6 +53,8 @@ impl Os {
         conn.xinput_xi_select_events(root, &[xinput::EventMask { deviceid: xinput::Device::ALL_MASTER.into(), mask: vec![mask] }])
             .map_err(other)?;
         conn.xtest_get_version(2, 2).map_err(other)?.reply().map_err(|_| io::Error::other("the X server has no XTest"))?;
+        // XFixes 4 hides the pointer without a grab. Without it, `conceal` just shows nothing new.
+        let _ = conn.xfixes_query_version(4, 0).map(|c| c.reply());
         conn.flush().map_err(other)?;
 
         let (grab_conn, _) = x11rb::connect(None).map_err(other)?;
@@ -78,7 +83,7 @@ impl Os {
         let atom = |name: &str| conn.intern_atom(false, name.as_bytes()).ok().and_then(|c| c.reply().ok()).map_or(NONE, |r| r.atom);
         let atoms = [atom("_NET_ACTIVE_WINDOW"), atom("_NET_WM_STATE"), atom("_NET_WM_STATE_FULLSCREEN")];
 
-        let grabbed = Arc::<AtomicBool>::default();
+        let (grabbed, concealed) = (Arc::<AtomicBool>::default(), Arc::<AtomicBool>::default());
         let os = Os {
             conn: conn.clone(),
             grab_conn: grab_conn.clone(),
@@ -86,12 +91,13 @@ impl Os {
             root,
             blank,
             grabbed: grabbed.clone(),
+            concealed: concealed.clone(),
             scroll: Cell::default(),
             atoms,
         };
         let (grabbed2, tx2) = (grabbed.clone(), tx.clone());
         let (grabbed3, watched) = (grabbed.clone(), grab_conn.clone());
-        std::thread::spawn(move || capture(conn, root, grabbed, tx));
+        std::thread::spawn(move || capture(conn, root, grabbed, concealed, tx));
         std::thread::spawn(move || grabbed_input(grab_conn, grabbed2, tx2));
         // The core hung while we hold the keyboard and mouse: let go, so this computer stays usable.
         std::thread::spawn(move || {
@@ -138,6 +144,16 @@ impl Os {
     /// A jump to the entry point or back home. Warping is immediate on X11, as moving is.
     pub fn place(&self, x: i32, y: i32) {
         self.move_to(x, y);
+        reveal(&self.conn, self.root, &self.concealed);
+    }
+
+    /// Hides the pointer where it stands, while the other computer is in use. It shows again
+    /// when this computer's own mouse moves, or the pointer is placed for a crossing.
+    pub fn conceal(&self) {
+        if !self.concealed.swap(true, Ordering::Relaxed) {
+            let _ = self.conn.xfixes_hide_cursor(self.root);
+            let _ = self.conn.flush();
+        }
     }
 
     pub fn move_to(&self, x: i32, y: i32) {
@@ -373,7 +389,7 @@ impl ksni::Tray for TrayModel {
 }
 
 /// Raw motion always, raw keys while not grabbed.
-fn capture(conn: Arc<RustConnection>, root: u32, grabbed: Arc<AtomicBool>, tx: mpsc::Sender<Input>) {
+fn capture(conn: Arc<RustConnection>, root: u32, grabbed: Arc<AtomicBool>, concealed: Arc<AtomicBool>, tx: mpsc::Sender<Input>) {
     // Motion comes in fractions of a pixel. The remainders carry over so none of it is lost.
     let (mut rx, mut ry) = (0.0, 0.0);
     loop {
@@ -391,6 +407,10 @@ fn capture(conn: Arc<RustConnection>, root: u32, grabbed: Arc<AtomicBool>, tx: m
                     continue;
                 }
                 let (dx, dy) = (dx as i32, dy as i32);
+                // Warps make no raw motion, so this is the mouse here: the pointer shows again.
+                if !grabbed {
+                    reveal(&conn, root, &concealed);
+                }
                 if grabbed {
                     Some(Event::Motion { x: 0, y: 0, dx, dy, dragging: false, grabbed: true })
                 } else {
@@ -514,6 +534,13 @@ fn button(detail: u8, down: bool) -> Option<Event> {
         6 => scroll(-120, 0),
         7 => scroll(120, 0),
         _ => None,
+    }
+}
+
+fn reveal(conn: &RustConnection, root: u32, concealed: &AtomicBool) {
+    if concealed.swap(false, Ordering::Relaxed) {
+        let _ = conn.xfixes_show_cursor(root);
+        let _ = conn.flush();
     }
 }
 

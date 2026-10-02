@@ -35,13 +35,13 @@ use windows_sys::Win32::UI::WindowsAndMessaging::{
     DispatchMessageW, GetClassNameW, GetCursorPos, GetDesktopWindow, GetForegroundWindow, GetMessageW, GetShellWindow, GetSystemMetrics,
     GetWindowRect, HICON, HWND_TOPMOST, KBDLLHOOKSTRUCT, LLKHF_EXTENDED, LLKHF_INJECTED, LLMHF_INJECTED, LWA_ALPHA, MF_CHECKED, MF_GRAYED,
     MF_SEPARATOR, MF_STRING, MSG, MSLLHOOKSTRUCT, PM_REMOVE, PeekMessageW, PostMessageW, RegisterClassW, RegisterWindowMessageW,
-    SM_CXCURSOR, SM_CXSCREEN, SM_CXVIRTUALSCREEN, SM_CYCURSOR, SM_CYSCREEN, SM_CYVIRTUALSCREEN, SM_XVIRTUALSCREEN, SM_YVIRTUALSCREEN,
-    SPI_SETCURSORS, SW_HIDE, SW_SHOWNOACTIVATE, SWP_HIDEWINDOW, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SWP_NOZORDER, SWP_SHOWWINDOW,
-    SetCursorPos, SetForegroundWindow, SetLayeredWindowAttributes, SetWindowPos, SetWindowsHookExW, ShowWindow, SystemParametersInfoW,
-    TPM_NONOTIFY, TPM_RETURNCMD, TPM_RIGHTBUTTON, TrackPopupMenu, ULW_ALPHA, UpdateLayeredWindow, WH_KEYBOARD_LL, WH_MOUSE_LL, WM_APP,
-    WM_INPUT, WM_KEYDOWN, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MBUTTONDOWN, WM_MBUTTONUP, WM_MOUSEHWHEEL, WM_MOUSEMOVE, WM_MOUSEWHEEL,
-    WM_RBUTTONDOWN, WM_RBUTTONUP, WM_SYSKEYDOWN, WM_XBUTTONDOWN, WM_XBUTTONUP, WNDCLASSW, WS_EX_LAYERED, WS_EX_NOACTIVATE,
-    WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_EX_TRANSPARENT, WS_POPUP, XBUTTON1, XBUTTON2,
+    SM_CXCURSOR, SM_CXVIRTUALSCREEN, SM_CYCURSOR, SM_CYVIRTUALSCREEN, SM_XVIRTUALSCREEN, SM_YVIRTUALSCREEN, SPI_SETCURSORS, SW_HIDE,
+    SW_SHOWNOACTIVATE, SWP_HIDEWINDOW, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SWP_NOZORDER, SWP_SHOWWINDOW, SetCursorPos,
+    SetForegroundWindow, SetLayeredWindowAttributes, SetWindowPos, SetWindowsHookExW, ShowWindow, SystemParametersInfoW, TPM_NONOTIFY,
+    TPM_RETURNCMD, TPM_RIGHTBUTTON, TrackPopupMenu, ULW_ALPHA, UpdateLayeredWindow, WH_KEYBOARD_LL, WH_MOUSE_LL, WM_APP, WM_INPUT,
+    WM_KEYDOWN, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MBUTTONDOWN, WM_MBUTTONUP, WM_MOUSEHWHEEL, WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_RBUTTONDOWN,
+    WM_RBUTTONUP, WM_SYSKEYDOWN, WM_XBUTTONDOWN, WM_XBUTTONUP, WNDCLASSW, WS_EX_LAYERED, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_EX_TOPMOST,
+    WS_EX_TRANSPARENT, WS_POPUP, XBUTTON1, XBUTTON2,
 };
 use windows_sys::core::BOOL;
 
@@ -56,13 +56,15 @@ const MARK: usize = 0x5955_4E54;
 // The hook and window procedures take no context, so what they share lives here.
 static EVENTS: OnceLock<mpsc::Sender<Input>> = OnceLock::new();
 static GRABBED: AtomicBool = AtomicBool::new(false);
+/// The hider is up while not grabbed, until this PC's own mouse moves.
+static CONCEALED: AtomicBool = AtomicBool::new(false);
 /// While grabbed: mouse moves the hook saw, and how many of them had not moved from the park.
 static HOOK_MOVES: AtomicU32 = AtomicU32::new(0);
 static HOOK_DRIFT: AtomicU32 = AtomicU32::new(0);
 /// Keys and mouse buttons that reach Windows even while grabbed: they stay on this PC.
 static KEPT: Mutex<(Vec<u16>, Vec<u8>)> = Mutex::new((Vec::new(), Vec::new()));
-/// While grabbed the cursor is parked here, on the hider. Moves are measured by Raw Input, as
-/// Beamer does: a position measured from here drifts as soon as one move gets past the hook.
+/// While grabbed or concealed the cursor stays here, where it was, on the hider. Moves are
+/// measured by Raw Input, as Beamer does, so the cursor need not sit anywhere in particular.
 static PARK: (AtomicI32, AtomicI32) = (AtomicI32::new(0), AtomicI32::new(0));
 static WINDOW: AtomicPtr<c_void> = AtomicPtr::new(ptr::null_mut());
 static TRAY: Mutex<(Look, String)> = Mutex::new((Look::Waiting, String::new()));
@@ -166,14 +168,12 @@ impl Os {
     /// Swallows this PC's input in the hooks, or stops swallowing it.
     pub fn grab(&self, on: bool) -> bool {
         if on {
-            let (x, y) = unsafe { (GetSystemMetrics(SM_CXSCREEN) / 2, GetSystemMetrics(SM_CYSCREEN) / 2) };
-            PARK.0.store(x, Ordering::Relaxed);
-            PARK.1.store(y, Ordering::Relaxed);
-            // The hider goes first, so the cursor is blank from the moment it lands there.
+            // Left where it is, so it never shows anywhere else.
+            park_here();
             hide_pointer(true);
-            unsafe { SetCursorPos(x, y) };
         }
         if GRABBED.swap(on, Ordering::Relaxed) != on && !on {
+            CONCEALED.store(false, Ordering::Relaxed);
             hide_pointer(false);
         }
         true
@@ -193,6 +193,16 @@ impl Os {
     /// entry point or back home would show the pointer where it was first.
     pub fn place(&self, x: i32, y: i32) {
         unsafe { SetCursorPos(x, y) };
+        reveal();
+    }
+
+    /// Hides the cursor where it stands, while the other computer is in use. It shows again when
+    /// this PC's own mouse moves, or the cursor is placed for a crossing.
+    pub fn conceal(&self) {
+        if !GRABBED.load(Ordering::Relaxed) && !CONCEALED.swap(true, Ordering::Relaxed) {
+            park_here();
+            hide_pointer(true);
+        }
     }
 
     /// The keys and buttons that stay here while driving: the hooks let them through.
@@ -401,6 +411,19 @@ fn make_hider(module: windows_sys::Win32::Foundation::HINSTANCE) -> HWND {
 /// Shows the hider under the parked cursor, or takes it away. From any thread: Windows hands
 /// the move to the input thread, which owns the window, and waits for it. Once the cursor sits
 /// on the hider, Windows asks it for a cursor and gets the blank one.
+fn park_here() {
+    let mut p = POINT { x: 0, y: 0 };
+    unsafe { GetCursorPos(&mut p) };
+    PARK.0.store(p.x, Ordering::Relaxed);
+    PARK.1.store(p.y, Ordering::Relaxed);
+}
+
+fn reveal() {
+    if CONCEALED.swap(false, Ordering::Relaxed) && !GRABBED.load(Ordering::Relaxed) {
+        hide_pointer(false);
+    }
+}
+
 fn hide_pointer(hide: bool) {
     let hider = HIDER.load(Ordering::Relaxed);
     if hider.is_null() {
@@ -498,6 +521,8 @@ unsafe extern "system" fn window_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lpar
             emit(Event::Motion { x: 0, y: 0, dx, dy, dragging: false, grabbed: true });
             return unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) };
         }
+        // Our own SendInput is filtered out above, so this is the mouse here.
+        reveal();
         let mut p = POINT { x: 0, y: 0 };
         let held = |vk: u16| unsafe { GetAsyncKeyState(vk as i32) } < 0;
         unsafe { GetCursorPos(&mut p) };

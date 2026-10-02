@@ -739,6 +739,7 @@ impl Core {
                 State::Driving => self.come_home(Some(pos)),
                 State::Driven => {
                     self.let_go();
+                    self.os.conceal();
                     self.send_clipboard();
                 }
                 State::Local => {}
@@ -759,6 +760,7 @@ impl Core {
                 if let Some(pos) = self.push(true, x, y, dx, dy, dragging) {
                     log!("the pointer went back out through the edge");
                     self.let_go();
+                    self.os.conceal();
                     self.send_clipboard();
                     self.send(Msg::Leave { pos: self.cfg.layout.to_peer(pos) });
                 }
