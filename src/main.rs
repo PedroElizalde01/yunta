@@ -177,26 +177,27 @@ fn run() -> io::Result<()> {
         }
     };
     if cfg.peer_key.is_none() {
-        // First run: pair before anything else. Started from a menu or at login, that happens
-        // in the settings window, which starts us again once paired.
-        if !io::stdin().is_terminal() {
+        // Not paired: in a terminal, pair there first. Started from a menu or at login, stay in
+        // the tray as "Not paired" and open the window to pair; pairing there restarts us.
+        if io::stdin().is_terminal() {
+            in_console(pair)?;
+            cfg = config::load()?;
+        } else {
             open_settings(Some("pairing"));
-            return Ok(());
         }
-        in_console(pair)?;
-        cfg = config::load()?;
     }
-    let peer_key = cfg.peer_key.clone().expect("paired");
-    let role = match &cfg.peer {
-        Some(host) => Role::Dial(host.clone()),
-        // ponytail: IPv4 only, bind [::] as well if a network ever needs IPv6
-        None => Role::Listen(TcpListener::bind(("0.0.0.0", cfg.port))?),
-    };
     let (tx, rx) = mpsc::channel();
     let os = os::Os::start(tx.clone())?;
     let tray = os::Tray::start(tx.clone());
-    let (key, port) = (cfg.key.clone(), cfg.port);
-    thread::spawn(move || link_thread(role, port, key, peer_key, tx));
+    if let Some(peer_key) = cfg.peer_key.clone() {
+        let role = match &cfg.peer {
+            Some(host) => Role::Dial(host.clone()),
+            // ponytail: IPv4 only, bind [::] as well if a network ever needs IPv6
+            None => Role::Listen(TcpListener::bind(("0.0.0.0", cfg.port))?),
+        };
+        let (key, port) = (cfg.key.clone(), cfg.port);
+        thread::spawn(move || link_thread(role, port, key, peer_key, tx));
+    }
     eprintln!("yunta running, config {}", cfg.path.display());
     Core::new(os, tray, cfg).run(rx);
     Ok(())
@@ -873,6 +874,7 @@ impl Core {
         // Offline whenever the other computer is not there; amber only while a wake-up is under way.
         let look = icon::Look::for_link(self.link.is_some(), self.waking(), self.cfg.paused);
         let status = match look {
+            icon::Look::Offline if self.cfg.peer_key.is_none() => "Not paired: click to pair".to_string(),
             icon::Look::Waiting => format!("Waking {peer}"),
             icon::Look::Offline => "Offline".to_string(),
             icon::Look::Linked => format!("Connected to {peer}"),
