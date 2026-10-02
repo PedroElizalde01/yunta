@@ -70,6 +70,10 @@ static TRAY: Mutex<(Look, String)> = Mutex::new((Look::Waiting, String::new()));
 const WM_TRAY_CLICK: u32 = WM_APP + 1;
 const WM_TRAY_SHOW: u32 = WM_APP + 2;
 static HIDER: AtomicPtr<c_void> = AtomicPtr::new(ptr::null_mut());
+/// The tray icon has been added (rather than needing adding).
+static ADDED: AtomicBool = AtomicBool::new(false);
+/// Sent to every top-level window when Explorer restarts, which loses everyone's tray icons.
+static TASKBAR_CREATED: AtomicU32 = AtomicU32::new(0);
 
 /// Output goes to the terminal that started us, if any. Nothing appears otherwise.
 pub fn attach_console() {
@@ -447,6 +451,8 @@ fn install() -> io::Result<()> {
             return Err(fail("CreateWindowExW"));
         }
         WINDOW.store(hwnd, Ordering::Relaxed);
+        let name: Vec<u16> = "TaskbarCreated\0".encode_utf16().collect();
+        TASKBAR_CREATED.store(RegisterWindowMessageW(name.as_ptr()), Ordering::Relaxed);
         HIDER.store(make_hider(module), Ordering::Relaxed);
         // Generic desktop mouse, delivered even while another window has focus.
         let mouse = RAWINPUTDEVICE { usUsagePage: 1, usUsage: 2, dwFlags: RIDEV_INPUTSINK, hwndTarget: hwnd };
@@ -473,6 +479,11 @@ fn emit(event: Event) {
 unsafe extern "system" fn window_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
     match msg {
         WM_TRAY_SHOW => show_tray(hwnd),
+        // Explorer restarted and dropped the icon: add it again.
+        _ if msg != 0 && msg == TASKBAR_CREATED.load(Ordering::Relaxed) => {
+            ADDED.store(false, Ordering::Relaxed);
+            show_tray(hwnd);
+        }
         // A click opens the settings, as tray icons do on Windows; a right click the menu.
         WM_TRAY_CLICK if lparam as u32 == WM_LBUTTONUP => crate::open_settings(None),
         WM_TRAY_CLICK if lparam as u32 == WM_RBUTTONUP => tray_menu(hwnd),
@@ -585,7 +596,6 @@ fn tray_data(hwnd: HWND) -> NOTIFYICONDATAW {
 
 /// Adds the icon the first time, updates it after.
 fn show_tray(hwnd: HWND) {
-    static ADDED: AtomicBool = AtomicBool::new(false);
     static ICON: AtomicPtr<c_void> = AtomicPtr::new(ptr::null_mut());
     let (look, status) = TRAY.lock().unwrap().clone();
     let mut data = tray_data(hwnd);
