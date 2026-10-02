@@ -70,6 +70,7 @@ enum Update {
 
 pub fn run(page: Option<&str>) -> io::Result<()> {
     let cfg = config::init()?;
+    crate::log::start(&cfg.path, "window");
     // ponytail: a second window just exits, raising the first one needs a message to it
     // A window restarting itself after an update lets go of the lock as it closes.
     let wait = if std::env::var_os(crate::RESTART).is_some() { Duration::from_secs(3) } else { Duration::ZERO };
@@ -174,6 +175,8 @@ struct App {
     /// When this window opened, and whether Yunta was quit from the tray since.
     opened: std::time::SystemTime,
     quit: bool,
+    /// What the last Copy log or Open log folder said.
+    log_note: Option<String>,
     /// The paired computer whose Forget is waiting for a second click.
     forgetting: Option<Vec<u8>>,
     /// When Forget was first pressed.
@@ -220,6 +223,7 @@ impl App {
             update: Arc::new(Mutex::new(Update::Idle)),
             opened: std::time::SystemTime::now(),
             quit: false,
+            log_note: None,
             forgetting: None,
             forget_asked: Instant::now(),
         };
@@ -1080,6 +1084,31 @@ impl App {
                 )
                 .color(palette(ui).weak),
             );
+        });
+        section(ui, "Troubleshooting");
+        card(ui, |ui| {
+            let detail = "Yunta writes what it does to a log on each computer. If something goes wrong, copy it and send it along.";
+            ui.label(RichText::new(detail).size(12.5).color(palette(ui).weak));
+            ui.add_space(6.0);
+            ui.horizontal(|ui| {
+                if ui.button("Copy log").clicked() {
+                    let text = crate::log::tail(&self.cfg.path, 400);
+                    self.log_note = Some(match arboard::Clipboard::new().and_then(|mut c| c.set_text(text)) {
+                        Ok(()) => "Copied the last 400 lines.".into(),
+                        Err(e) => format!("Could not copy it: {e}"),
+                    });
+                }
+                if ui.button("Open log folder").clicked() {
+                    let dir = self.cfg.path.parent().map(|d| d.to_path_buf()).unwrap_or_default();
+                    let opener = if cfg!(windows) { "explorer" } else { "xdg-open" };
+                    if let Err(e) = Command::new(opener).arg(&dir).spawn() {
+                        self.log_note = Some(format!("Could not open {}: {e}", dir.display()));
+                    }
+                }
+                if let Some(note) = &self.log_note {
+                    ui.label(RichText::new(note).size(12.5).color(palette(ui).weak));
+                }
+            });
         });
         section(ui, "Updates");
         let mut check = false;

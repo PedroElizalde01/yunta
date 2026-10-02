@@ -1,6 +1,13 @@
 // No console window when started from the Start menu or at login; subcommands open their own.
 #![cfg_attr(windows, windows_subsystem = "windows")]
 
+/// A line in the log: stderr, and yunta.log next to yunta.conf (see log.rs).
+macro_rules! log {
+    ($($t:tt)*) => {
+        $crate::log::write(format_args!($($t)*))
+    };
+}
+
 mod autostart;
 mod clip;
 mod config;
@@ -9,6 +16,7 @@ mod fx;
 mod icon;
 mod keymap;
 mod link;
+mod log;
 mod msg;
 mod pair;
 mod settings;
@@ -102,12 +110,12 @@ fn main() {
         Some("pair") => in_console(pair),
         Some("settings") => settings::run(std::env::args().nth(2).as_deref()),
         Some(_) => {
-            eprintln!("usage: yunta [init | pair | settings]");
+            log!("usage: yunta [init | pair | settings]");
             std::process::exit(2);
         }
     };
     if let Err(e) = result {
-        eprintln!("yunta: {e}");
+        log!("yunta: {e}");
         std::process::exit(1);
     }
 }
@@ -140,7 +148,7 @@ pub fn open_settings(page: Option<&str>) {
     match child {
         // Waited for, so it does not linger as a zombie on Linux.
         Ok(mut child) => drop(thread::spawn(move || child.wait())),
-        Err(e) => eprintln!("settings: {e}"),
+        Err(e) => log!("settings: {e}"),
     }
 }
 
@@ -160,6 +168,7 @@ enum Role {
 
 fn run() -> io::Result<()> {
     let mut cfg = config::init()?;
+    log::start(&cfg.path, "app");
     update::tidy();
     let _ = std::fs::remove_file(config::quit_path(&cfg.path));
     // Held until we exit: a second copy would open a second link, or fight over the input.
@@ -200,7 +209,7 @@ fn run() -> io::Result<()> {
         let (key, port) = (cfg.key.clone(), cfg.port);
         thread::spawn(move || link_thread(role, port, key, peer_key, tx));
     }
-    eprintln!("yunta running, config {}", cfg.path.display());
+    log!("yunta running, config {}", cfg.path.display());
     Core::new(os, tray, cfg).run(rx);
     Ok(())
 }
@@ -231,13 +240,13 @@ fn link_thread(role: Role, port: u16, key: Vec<u8>, peer_key: Vec<u8>, tx: mpsc:
                         Err(e) => break e.to_string(),
                     }
                 };
-                eprintln!("link down: {why}");
+                log!("link down: {why}");
                 if tx.send(Input::Down).is_err() {
                     return;
                 }
             }
             Err(e) => {
-                eprintln!("link: {e}");
+                log!("link: {e}");
                 if tx.send(Input::Down).is_err() {
                     return;
                 }
@@ -302,6 +311,9 @@ struct Core {
     pointer: (i32, i32),
     /// While driven: when our own mouse started moving, and how far it has gone since.
     moved: (Instant, i32),
+    /// Moves sent while driving and taken in while driven, since the last line in the log.
+    moves: u32,
+    reported: Instant,
     /// An app fills the peer's screen, so its edge is not crossed into.
     peer_busy: Option<Rect>,
     /// What we last told the peer about our own full-screen app.
@@ -338,6 +350,8 @@ impl Core {
             woke_at: None,
             pointer: (0, 0),
             moved: (now, 0),
+            moves: 0,
+            reported: now,
             peer_busy: None,
             busy: None,
             cfg,
@@ -356,7 +370,7 @@ impl Core {
                 Ok(Input::Quit) => {
                     self.shut_down();
                     if let Err(e) = std::fs::write(config::quit_path(&self.cfg.path), "") {
-                        eprintln!("quit: {e}");
+                        log!("quit: {e}");
                     }
                     return;
                 }
@@ -384,6 +398,7 @@ impl Core {
                 }
                 self.displays_at = Instant::now();
             }
+            self.report();
             let at = modified(&self.cfg.path);
             if at != self.cfg_at {
                 self.cfg_at = at;
@@ -391,6 +406,19 @@ impl Core {
             }
             self.write_status();
         }
+    }
+
+    /// Once a second while input crosses, a line on how it flows, to see where it stops.
+    fn report(&mut self) {
+        if self.state == State::Local || self.reported.elapsed() < Duration::from_secs(1) {
+            return;
+        }
+        let (seen, still) = self.os.hook_stats();
+        match self.state {
+            State::Driving => log!("driving: {} moves sent; the mouse hook saw {seen} moves, {still} of them standing still", self.moves),
+            _ => log!("driven: {} moves taken in, pointer at {:?}", self.moves, self.pointer),
+        }
+        (self.moves, self.reported) = (0, Instant::now());
     }
 
     /// Milliseconds since we started, the trigger key's clock.
@@ -411,14 +439,14 @@ impl Core {
     fn reload(&mut self) {
         let cfg = match config::load() {
             Ok(cfg) => cfg,
-            Err(e) => return eprintln!("config: {e}"),
+            Err(e) => return log!("config: {e}"),
         };
         // Paired again, or asked to after an update: the simplest is to start over.
         if (&cfg.peer_key, &cfg.peer, cfg.port, cfg.restart) != (&self.cfg.peer_key, &self.cfg.peer, self.cfg.port, self.cfg.restart) {
-            eprintln!("restarting");
+            log!("restarting");
             self.shut_down();
             if let Err(e) = exe().and_then(|exe| Command::new(exe).env(RESTART, "1").spawn()) {
-                eprintln!("restart: {e}");
+                log!("restart: {e}");
             }
             std::process::exit(0);
         }
@@ -469,7 +497,7 @@ impl Core {
         let Some(device) = self.cfg.devices.iter_mut().find(|d| d.key == key) else { return };
         change(device);
         if let Err(e) = config::save_devices(&self.cfg.path, &self.cfg.devices) {
-            eprintln!("devices: {e}");
+            log!("devices: {e}");
         }
     }
 
@@ -506,7 +534,7 @@ impl Core {
         let path = config::status_path(&self.cfg.path);
         let aside = path.with_extension("new");
         if let Err(e) = std::fs::write(&aside, &status).and_then(|()| std::fs::rename(&aside, &path)) {
-            eprintln!("status: {e}");
+            log!("status: {e}");
         }
         self.status = status;
         // The tray says the same, and a wake-up runs out without a message.
@@ -516,7 +544,7 @@ impl Core {
     fn handle(&mut self, input: Input) {
         match input {
             Input::Up(link, addr) => {
-                eprintln!("linked");
+                log!("linked");
                 self.woke_at = None;
                 self.link = Some(link);
                 self.send(Msg::Displays(self.displays.clone()));
@@ -530,7 +558,7 @@ impl Core {
                 {
                     self.cfg.peer_mac = Some(mac);
                     if let Err(e) = config::set(&self.cfg.path, "peer_mac", Some(&config::mac_text(&mac))) {
-                        eprintln!("peer_mac: {e}");
+                        log!("peer_mac: {e}");
                     }
                 }
                 let mac = self.cfg.peer_mac;
@@ -550,7 +578,7 @@ impl Core {
             Input::Pause(paused) => {
                 self.cfg.paused = paused;
                 if let Err(e) = config::set(&self.cfg.path, "paused", Some(if paused { "yes" } else { "no" })) {
-                    eprintln!("pause: {e}");
+                    log!("pause: {e}");
                 }
                 self.show_status();
             }
@@ -569,7 +597,10 @@ impl Core {
     fn local(&mut self, event: Event) {
         match event {
             Event::Motion { x, y, dx, dy, dragging, grabbed } => match self.state {
-                State::Driving => self.send(Msg::Move { dx: clamp16(dx), dy: clamp16(dy) }),
+                State::Driving => {
+                    self.moves += 1;
+                    self.send(Msg::Move { dx: clamp16(dx), dy: clamp16(dy) })
+                }
                 // Still queued from the grab after coming home: its (0, 0) is no place to push from.
                 _ if grabbed => {}
                 // Our moves while driven are warps (X11) or marked as ours (Windows), so motion
@@ -625,7 +656,7 @@ impl Core {
     /// A kept key or button, played here. If the grab could not be taken back, input comes home.
     fn play_local(&mut self, msg: Msg) {
         if !self.os.play_local(&msg) {
-            eprintln!("could not take the keyboard and mouse back after a kept key");
+            log!("could not take the keyboard and mouse back after a kept key");
             self.send(Msg::Leave { pos: 0 });
             self.come_home(None);
         }
@@ -658,8 +689,8 @@ impl Core {
         }
         self.woke_at = Some(Instant::now());
         match wake::send(&mac) {
-            Ok(()) => eprintln!("waking {}", config::mac_text(&mac)),
-            Err(e) => eprintln!("wake: {e}"),
+            Ok(()) => log!("waking {}", config::mac_text(&mac)),
+            Err(e) => log!("wake: {e}"),
         }
         self.show_status();
     }
@@ -677,7 +708,7 @@ impl Core {
                 }
                 // Not allowed in: back it goes, to where it came from.
                 if !self.cfg.receive {
-                    eprintln!("refused: this computer does not let the other one in");
+                    log!("refused: this computer does not let the other one in");
                     return self.send(Msg::Leave { pos: self.cfg.layout.to_peer(pos) });
                 }
                 self.back = Crossing::new(edge, self.cfg.resistance);
@@ -686,6 +717,8 @@ impl Core {
                 self.os.place(self.pointer.0, self.pointer.1);
                 self.arrive(self.pointer.0, self.pointer.1);
                 self.state = State::Driven;
+                (self.moves, self.reported) = (0, Instant::now());
+                log!("the other computer came in through the {} edge, pointer to {:?}", edge.name(), self.pointer);
             }
             Msg::Leave { pos } => match self.state {
                 State::Driving => self.come_home(Some(pos)),
@@ -696,6 +729,7 @@ impl Core {
                 State::Local => {}
             },
             Msg::Move { dx, dy } if self.state == State::Driven => {
+                self.moves += 1;
                 // Scaled by this machine's pointer speed for the peer, keeping the fractions.
                 let speed = self.cfg.pointer_speed;
                 let (fx, fy) = (f32::from(dx) * speed + self.rest.0, f32::from(dy) * speed + self.rest.1);
@@ -708,6 +742,7 @@ impl Core {
                 self.os.move_to(x, y);
                 let dragging = self.held_here.iter().any(|m| matches!(m, Msg::Button { .. }));
                 if let Some(pos) = self.push(true, x, y, dx, dy, dragging) {
+                    log!("the pointer went back out through the edge");
                     self.let_go();
                     self.send_clipboard();
                     self.send(Msg::Leave { pos: self.cfg.layout.to_peer(pos) });
@@ -735,15 +770,21 @@ impl Core {
                 if self.cfg.peer_name.as_deref() != Some(name.as_str()) && !name.is_empty() {
                     let name = config::clean_name(&name);
                     if let Err(e) = config::set(&self.cfg.path, "peer_name", Some(&name)) {
-                        eprintln!("peer_name: {e}");
+                        log!("peer_name: {e}");
                     }
                     self.note_device(|d| d.name = name.clone());
                     self.cfg.peer_name = Some(name);
                 }
                 self.show_status();
             }
-            Msg::Busy(busy) => self.peer_busy = busy,
-            Msg::TakeBack if self.state == State::Driving => self.come_home_to(None, false),
+            Msg::Busy(busy) => {
+                log!("the other computer's full-screen app: {busy:?}");
+                self.peer_busy = busy
+            }
+            Msg::TakeBack if self.state == State::Driving => {
+                log!("the other computer's own mouse moved: coming home");
+                self.come_home_to(None, false)
+            }
             Msg::Displays(displays) => self.peer_displays = displays,
             Msg::Layout(theirs) => {
                 // The newer arrangement wins. A tie, as when neither was ever set, goes to the
@@ -751,7 +792,7 @@ impl Core {
                 let ours = self.cfg.layout;
                 let dialer = self.cfg.peer.is_some();
                 if theirs.mirror() != ours && (theirs.stamp > ours.stamp || (theirs.stamp == ours.stamp && !dialer)) {
-                    eprintln!("layout: the other machine is on the {} side", theirs.mirror().edge.name());
+                    log!("layout: the other machine is on the {} side", theirs.mirror().edge.name());
                     self.set_layout(theirs.mirror(), true);
                 }
             }
@@ -768,10 +809,12 @@ impl Core {
         // Before the grab, which parks the cursor on Windows.
         self.exit = self.os.cursor();
         if !self.os.grab(true) {
-            eprintln!("could not take the keyboard and mouse: another app is holding them");
+            log!("could not take the keyboard and mouse: another app is holding them");
             return;
         }
         self.state = State::Driving;
+        (self.moves, self.reported) = (0, Instant::now());
+        log!("driving the other computer, in at {pos} along its edge; our pointer left from {:?}", self.exit);
         self.send_clipboard();
         self.send(Msg::Enter { edge: self.cfg.layout.edge.opposite(), pos });
     }
@@ -782,7 +825,7 @@ impl Core {
         self.cfg.layout = layout;
         self.out = Crossing::new(layout.edge, self.cfg.resistance);
         if save && let Err(e) = config::save_layout(&self.cfg.path, &layout) {
-            eprintln!("layout: {e}");
+            log!("layout: {e}");
         }
     }
 
@@ -798,6 +841,7 @@ impl Core {
             self.send(up);
         }
         let (x, y) = pos.and_then(|p| crossing::entry_point(&self.displays, self.cfg.layout.edge, p)).unwrap_or(self.exit);
+        log!("home, pointer at {:?}", (x, y));
         // Placed before letting go, so the pointer never shows where it was parked.
         self.os.place(x, y);
         self.os.grab(false);
@@ -815,7 +859,7 @@ impl Core {
         }
         self.moved.1 += dx.abs() + dy.abs();
         if self.moved.1 >= TAKE_BACK {
-            eprintln!("this computer's own mouse moved: taking it back");
+            log!("this computer's own mouse moved: taking it back");
             self.moved.1 = 0;
             self.let_go();
             self.send(Msg::TakeBack);
@@ -929,7 +973,7 @@ impl Core {
         self.last_send = Instant::now();
         let Some(link) = &mut self.link else { return };
         if let Err(e) = link.send(&msg.encode()) {
-            eprintln!("link: {e}");
+            log!("link: {e}");
             self.link = None;
             self.fall_back();
         }
@@ -986,6 +1030,26 @@ mod tests {
         assert!(matches!(rx.recv_timeout(Duration::from_secs(3)).unwrap(), Input::Down));
         drop(rx);
         worker.join().unwrap();
+    }
+
+    /// Plays the other computer driving a copy of Yunta that is already running: comes in, then
+    /// moves the pointer. Run by hand, with YUNTA_PEER_CONFIG set to the config of the computer
+    /// to play and YUNTA_DRIVE to the running copy's address:
+    /// `cargo test --release -- --ignored drive_a_running_copy`.
+    #[test]
+    #[ignore]
+    fn drive_a_running_copy() {
+        let me = config::load_from(Path::new(&std::env::var("YUNTA_PEER_CONFIG").unwrap())).unwrap();
+        let (mut tx, _rx) = link::connect(std::env::var("YUNTA_DRIVE").unwrap().as_str(), &me.key, me.peer_key.as_ref().unwrap()).unwrap();
+        let mut send = |m: Msg| tx.send(&m.encode()).unwrap();
+        send(Msg::Enter { edge: me.layout.edge.opposite(), pos: 32768 });
+        for _ in 0..40 {
+            send(Msg::Move { dx: 0, dy: -5 });
+            thread::sleep(Duration::from_millis(10));
+        }
+        thread::sleep(Duration::from_millis(1500));
+        send(Msg::Leave { pos: 32768 });
+        thread::sleep(Duration::from_millis(200));
     }
 
     #[test]

@@ -5,7 +5,7 @@
 
 use std::ffi::c_void;
 use std::sync::Mutex;
-use std::sync::atomic::{AtomicBool, AtomicI32, AtomicPtr, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI32, AtomicPtr, AtomicU32, Ordering};
 use std::sync::{OnceLock, mpsc};
 use std::{io, mem, ptr};
 
@@ -56,6 +56,9 @@ const MARK: usize = 0x5955_4E54;
 // The hook and window procedures take no context, so what they share lives here.
 static EVENTS: OnceLock<mpsc::Sender<Input>> = OnceLock::new();
 static GRABBED: AtomicBool = AtomicBool::new(false);
+/// While grabbed: mouse moves the hook saw, and how many of them had not moved from the park.
+static HOOK_MOVES: AtomicU32 = AtomicU32::new(0);
+static HOOK_STILL: AtomicU32 = AtomicU32::new(0);
 /// Keys and mouse buttons that reach Windows even while grabbed: they stay on this PC.
 static KEPT: Mutex<(Vec<u16>, Vec<u8>)> = Mutex::new((Vec::new(), Vec::new()));
 /// While grabbed the cursor is parked here, and each swallowed move is measured from it. That
@@ -169,6 +172,11 @@ impl Os {
             hide_pointer(false);
         }
         true
+    }
+
+    /// Mouse moves the hook saw while grabbed, and how many stood still, since last asked.
+    pub fn hook_stats(&self) -> (u32, u32) {
+        (HOOK_MOVES.swap(0, Ordering::Relaxed), HOOK_STILL.swap(0, Ordering::Relaxed))
     }
 
     /// Puts the pointer at (x, y) at once. SendInput lands a moment later, so a jump to the
@@ -526,6 +534,10 @@ unsafe extern "system" fn mouse_proc(code: i32, wparam: WPARAM, lparam: LPARAM) 
             let event = match msg {
                 WM_MOUSEMOVE => {
                     let (dx, dy) = (m.pt.x - PARK.0.load(Ordering::Relaxed), m.pt.y - PARK.1.load(Ordering::Relaxed));
+                    HOOK_MOVES.fetch_add(1, Ordering::Relaxed);
+                    if dx == 0 && dy == 0 {
+                        HOOK_STILL.fetch_add(1, Ordering::Relaxed);
+                    }
                     (dx != 0 || dy != 0).then_some(Event::Motion { x: 0, y: 0, dx, dy, dragging: false, grabbed: true })
                 }
                 WM_LBUTTONDOWN | WM_LBUTTONUP => Some(Event::Button { button: 1, down }),
@@ -623,7 +635,7 @@ fn tray_menu(hwnd: HWND) {
         PAUSE => send(Input::Pause(!paused)),
         AUTOSTART => {
             if let Err(e) = autostart::set(!autostart) {
-                eprintln!("start at login: {e}");
+                log!("start at login: {e}");
             }
         }
         QUIT => send(Input::Quit),

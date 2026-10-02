@@ -24,7 +24,7 @@ impl Clip {
         match Clipboard::new() {
             Ok(board) => Some(Clip { board, last: 0 }),
             Err(e) => {
-                eprintln!("clipboard unavailable: {e}");
+                log!("clipboard unavailable: {e}");
                 None
             }
         }
@@ -51,12 +51,12 @@ impl Clip {
             Msg::ClipText(text) => self.board.set_text(text.as_str()),
             Msg::ClipPng(png) => match decode(png) {
                 Some(img) => self.board.set_image(img),
-                None => return eprintln!("clipboard: the peer sent an image that is not a PNG"),
+                None => return log!("clipboard: the peer sent an image that is not a PNG"),
             },
             _ => return,
         };
         if let Err(e) = result {
-            eprintln!("clipboard: {e}");
+            log!("clipboard: {e}");
         }
     }
 }

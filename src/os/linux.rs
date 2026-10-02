@@ -111,6 +111,11 @@ impl Os {
         pointer(&self.conn, self.root).map_or((0, 0), |p| (p.root_x.into(), p.root_y.into()))
     }
 
+    /// X11 has no mouse hook to count for the log.
+    pub fn hook_stats(&self) -> (u32, u32) {
+        (0, 0)
+    }
+
     /// A jump to the entry point or back home. Warping is immediate on X11, as moving is.
     pub fn place(&self, x: i32, y: i32) {
         self.move_to(x, y);
@@ -259,7 +264,7 @@ impl Tray {
         match model.spawn() {
             Ok(handle) => Some(Tray(handle)),
             Err(e) => {
-                eprintln!("no tray icon: {e}");
+                log!("no tray icon: {e}");
                 None
             }
         }
@@ -330,7 +335,7 @@ impl ksni::Tray for TrayModel {
                 checked: self.autostart,
                 activate: Box::new(|m: &mut Self| match autostart::set(!m.autostart) {
                     Ok(()) => m.autostart = !m.autostart,
-                    Err(e) => eprintln!("start at login: {e}"),
+                    Err(e) => log!("start at login: {e}"),
                 }),
                 ..Default::default()
             }
@@ -445,7 +450,7 @@ fn swipe_direction(dx: f64, dy: f64) -> Option<u8> {
 
 fn next_event(conn: &RustConnection) -> XEvent {
     conn.wait_for_event().unwrap_or_else(|e| {
-        eprintln!("X11 connection lost: {e}");
+        log!("X11 connection lost: {e}");
         std::process::exit(1)
     })
 }
@@ -520,7 +525,7 @@ pub struct Overlay {
 impl Overlay {
     /// None without a compositor: without one, the alpha would show as black.
     pub fn new() -> Option<Overlay> {
-        Overlay::make().map_err(|e| eprintln!("no crossing animations: {e}")).ok().flatten()
+        Overlay::make().map_err(|e| log!("no crossing animations: {e}")).ok().flatten()
     }
 
     fn make() -> io::Result<Option<Overlay>> {
