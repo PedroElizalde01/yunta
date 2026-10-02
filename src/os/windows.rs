@@ -34,14 +34,14 @@ use windows_sys::Win32::UI::WindowsAndMessaging::{
     AppendMenuW, CallNextHookEx, CreateCursor, CreateIcon, CreatePopupMenu, CreateWindowExW, DefWindowProcW, DestroyIcon, DestroyMenu,
     DispatchMessageW, GetClassNameW, GetCursorPos, GetDesktopWindow, GetForegroundWindow, GetMessageW, GetShellWindow, GetSystemMetrics,
     GetWindowRect, HICON, HWND_TOPMOST, KBDLLHOOKSTRUCT, LLKHF_EXTENDED, LLKHF_INJECTED, LLMHF_INJECTED, LWA_ALPHA, MF_CHECKED, MF_GRAYED,
-    MF_SEPARATOR, MF_STRING, MSG, MSLLHOOKSTRUCT, PM_REMOVE, PeekMessageW, PostMessageW, RegisterClassW, SM_CXCURSOR, SM_CXSCREEN,
-    SM_CXVIRTUALSCREEN, SM_CYCURSOR, SM_CYSCREEN, SM_CYVIRTUALSCREEN, SM_XVIRTUALSCREEN, SM_YVIRTUALSCREEN, SPI_SETCURSORS, SW_HIDE,
-    SW_SHOWNOACTIVATE, SWP_HIDEWINDOW, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SWP_NOZORDER, SWP_SHOWWINDOW, SetCursorPos,
-    SetForegroundWindow, SetLayeredWindowAttributes, SetWindowPos, SetWindowsHookExW, ShowWindow, SystemParametersInfoW, TPM_NONOTIFY,
-    TPM_RETURNCMD, TPM_RIGHTBUTTON, TrackPopupMenu, ULW_ALPHA, UpdateLayeredWindow, WH_KEYBOARD_LL, WH_MOUSE_LL, WM_APP, WM_INPUT,
-    WM_KEYDOWN, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MBUTTONDOWN, WM_MBUTTONUP, WM_MOUSEHWHEEL, WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_RBUTTONDOWN,
-    WM_RBUTTONUP, WM_SYSKEYDOWN, WM_XBUTTONDOWN, WM_XBUTTONUP, WNDCLASSW, WS_EX_LAYERED, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_EX_TOPMOST,
-    WS_EX_TRANSPARENT, WS_POPUP, XBUTTON1, XBUTTON2,
+    MF_SEPARATOR, MF_STRING, MSG, MSLLHOOKSTRUCT, PM_REMOVE, PeekMessageW, PostMessageW, RegisterClassW, RegisterWindowMessageW,
+    SM_CXCURSOR, SM_CXSCREEN, SM_CXVIRTUALSCREEN, SM_CYCURSOR, SM_CYSCREEN, SM_CYVIRTUALSCREEN, SM_XVIRTUALSCREEN, SM_YVIRTUALSCREEN,
+    SPI_SETCURSORS, SW_HIDE, SW_SHOWNOACTIVATE, SWP_HIDEWINDOW, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SWP_NOZORDER, SWP_SHOWWINDOW,
+    SetCursorPos, SetForegroundWindow, SetLayeredWindowAttributes, SetWindowPos, SetWindowsHookExW, ShowWindow, SystemParametersInfoW,
+    TPM_NONOTIFY, TPM_RETURNCMD, TPM_RIGHTBUTTON, TrackPopupMenu, ULW_ALPHA, UpdateLayeredWindow, WH_KEYBOARD_LL, WH_MOUSE_LL, WM_APP,
+    WM_INPUT, WM_KEYDOWN, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MBUTTONDOWN, WM_MBUTTONUP, WM_MOUSEHWHEEL, WM_MOUSEMOVE, WM_MOUSEWHEEL,
+    WM_RBUTTONDOWN, WM_RBUTTONUP, WM_SYSKEYDOWN, WM_XBUTTONDOWN, WM_XBUTTONUP, WNDCLASSW, WS_EX_LAYERED, WS_EX_NOACTIVATE,
+    WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_EX_TRANSPARENT, WS_POPUP, XBUTTON1, XBUTTON2,
 };
 use windows_sys::core::BOOL;
 
@@ -144,6 +144,7 @@ impl Os {
         }
         let mut out: Vec<Rect> = Vec::new();
         unsafe { EnumDisplayMonitors(ptr::null_mut(), ptr::null(), Some(each), &mut out as *mut Vec<Rect> as LPARAM) };
+        out.retain(Rect::sane);
         out
     }
 
@@ -223,7 +224,7 @@ impl Os {
                 && GetMonitorInfoW(MonitorFromWindow(window, MONITOR_DEFAULTTONEAREST), &mut info) != 0
                 && (rect.left, rect.top, rect.right, rect.bottom)
                     == (info.rcMonitor.left, info.rcMonitor.top, info.rcMonitor.right, info.rcMonitor.bottom);
-            full.then(|| Rect { x: rect.left, y: rect.top, w: rect.right - rect.left, h: rect.bottom - rect.top })
+            full.then(|| Rect { x: rect.left, y: rect.top, w: rect.right - rect.left, h: rect.bottom - rect.top }).filter(Rect::sane)
         }
     }
 

@@ -118,6 +118,7 @@ impl Os {
             let s = &self.conn.setup().roots[self.screen];
             out.push(Rect { x: 0, y: 0, w: s.width_in_pixels.into(), h: s.height_in_pixels.into() });
         }
+        out.retain(Rect::sane);
         out
     }
 
@@ -213,7 +214,7 @@ impl Os {
         }
         let size = self.conn.get_geometry(window).ok()?.reply().ok()?;
         let at = self.conn.translate_coordinates(window, self.root, 0, 0).ok()?.reply().ok()?;
-        Some(Rect { x: at.dst_x.into(), y: at.dst_y.into(), w: size.width.into(), h: size.height.into() })
+        Some(Rect { x: at.dst_x.into(), y: at.dst_y.into(), w: size.width.into(), h: size.height.into() }).filter(Rect::sane)
     }
 
     pub fn inject(&self, msg: &Msg) {

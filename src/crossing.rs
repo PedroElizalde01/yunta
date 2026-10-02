@@ -66,10 +66,17 @@ impl Rect {
     pub fn parse_list(text: &str) -> Vec<Rect> {
         text.split(';')
             .filter_map(|r| match r.split_whitespace().map(str::parse).collect::<Result<Vec<i32>, _>>().ok()?[..] {
-                [x, y, w, h] if w > 0 && h > 0 => Some(Rect { x, y, w, h }),
+                [x, y, w, h] => Some(Rect { x, y, w, h }).filter(Rect::sane),
                 _ => None,
             })
             .collect()
+    }
+
+    /// A real screen's worth: some size, and far enough inside the i32 range that adding a size
+    /// to a position never overflows. Rectangles from the peer, files and the OS must pass.
+    pub fn sane(&self) -> bool {
+        const FAR: i32 = 1 << 20;
+        (1..=FAR).contains(&self.w) && (1..=FAR).contains(&self.h) && (-FAR..=FAR).contains(&self.x) && (-FAR..=FAR).contains(&self.y)
     }
 
     pub fn contains(&self, x: i32, y: i32) -> bool {
@@ -381,6 +388,7 @@ mod tests {
         assert_eq!(Rect::parse_list(&Rect::list_text(&[A, B])), vec![A, B]);
         assert_eq!(Rect::parse_list(""), vec![]);
         assert_eq!(Rect::parse_list("1 2 3; 0 0 10 10; 0 0 0 5"), vec![Rect { x: 0, y: 0, w: 10, h: 10 }]);
+        assert!(Rect::parse_list("2147483000 0 1000 10").is_empty()); // would overflow
     }
 
     #[test]

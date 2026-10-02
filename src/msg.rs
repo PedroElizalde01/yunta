@@ -162,7 +162,7 @@ impl Msg {
                 let at = |i: usize| i32::from_be_bytes(r[i..i + 4].try_into().unwrap());
                 let rects: Vec<Rect> =
                     (0..r.len()).step_by(16).map(|i| Rect { x: at(i), y: at(i + 4), w: at(i + 8), h: at(i + 12) }).collect();
-                if rects.iter().any(|d| d.w <= 0 || d.h <= 0) {
+                if !rects.iter().all(Rect::sane) {
                     return None;
                 }
                 (Msg::Displays(rects), r.len())
@@ -185,7 +185,11 @@ impl Msg {
             13 if r.is_empty() => (Msg::Busy(None), 0),
             13 => {
                 let at = |i: usize| Some(i32::from_be_bytes(r.get(i..i + 4)?.try_into().ok()?));
-                (Msg::Busy(Some(Rect { x: at(0)?, y: at(4)?, w: at(8)?, h: at(12)? })), 16)
+                let busy = Rect { x: at(0)?, y: at(4)?, w: at(8)?, h: at(12)? };
+                if !busy.sane() {
+                    return None;
+                }
+                (Msg::Busy(Some(busy)), 16)
             }
             14 => (Msg::TakeBack, 0),
             _ => return None,
@@ -236,6 +240,11 @@ mod tests {
         assert_eq!(Msg::decode(&backwards), None);
         assert_eq!(Msg::decode(&[11, 1, b'a', 7]), None); // a control character in the name
         assert_eq!(Msg::decode(&[12, 3, 4]), None); // no such direction
+        let mut busy = vec![13];
+        for v in [0i32, 0, -5, 10] {
+            busy.extend_from_slice(&v.to_be_bytes());
+        }
+        assert_eq!(Msg::decode(&busy), None); // a full-screen app of negative width
         assert_eq!(Msg::decode(&[99]), None);
     }
 }
