@@ -290,7 +290,7 @@ struct Core {
     /// The peer lets our keyboard and mouse in. Assumed until its Hello says otherwise.
     peer_receives: bool,
     /// Whether an app is full screen here, and when that was last asked.
-    fullscreen: (Instant, bool),
+    fullscreen: (Instant, Option<Rect>),
     /// The parts of a pixel the peer's moves add up to, under a pointer speed that is not whole.
     rest: (f32, f32),
     /// When we last sent a wake-up.
@@ -301,9 +301,9 @@ struct Core {
     /// While driven: when our own mouse started moving, and how far it has gone since.
     moved: (Instant, i32),
     /// An app fills the peer's screen, so its edge is not crossed into.
-    peer_busy: bool,
+    peer_busy: Option<Rect>,
     /// What we last told the peer about our own full-screen app.
-    busy: bool,
+    busy: Option<Rect>,
 }
 
 impl Core {
@@ -331,13 +331,13 @@ impl Core {
             fx: if cfg.effects { fx::Fx::start() } else { None },
             glowing: false,
             peer_receives: true,
-            fullscreen: (now - Duration::from_secs(1), false),
+            fullscreen: (now - Duration::from_secs(1), None),
             rest: (0.0, 0.0),
             woke_at: None,
             pointer: (0, 0),
             moved: (now, 0),
-            peer_busy: false,
-            busy: false,
+            peer_busy: None,
+            busy: None,
             cfg,
         };
         core.apply_keep();
@@ -366,7 +366,7 @@ impl Core {
                 self.switch();
             }
             // While an app fills our screen, the peer is told not to cross into it.
-            let busy = self.link.is_some() && self.cfg.fullscreen && self.fullscreen();
+            let busy = if self.link.is_some() && self.cfg.fullscreen { self.fullscreen() } else { None };
             if busy != self.busy {
                 self.busy = busy;
                 self.send(Msg::Busy(busy));
@@ -493,7 +493,7 @@ impl Core {
             yes(self.cfg.paused),
             yes(self.waking()),
             yes(self.peer_receives),
-            yes(self.peer_busy),
+            yes(self.peer_busy.is_some()),
             Rect::list_text(&self.displays),
             Rect::list_text(&self.peer_displays)
         );
@@ -520,7 +520,7 @@ impl Core {
                 self.send(Msg::Displays(self.displays.clone()));
                 self.send(Msg::Layout(self.cfg.layout));
                 self.hello();
-                self.busy = self.cfg.fullscreen && self.fullscreen();
+                self.busy = if self.cfg.fullscreen { self.fullscreen() } else { None };
                 self.send(Msg::Busy(self.busy));
                 // Fresh in the ARP table now, so this is the time to learn it for waking later.
                 if let Some(mac) = addr.and_then(wake::mac_of)
@@ -541,7 +541,7 @@ impl Core {
             Input::Down => {
                 self.link = None;
                 self.peer_receives = true;
-                self.peer_busy = false;
+                self.peer_busy = None;
                 self.fall_back();
                 self.show_status();
             }
@@ -573,7 +573,7 @@ impl Core {
                 State::Driven => self.take_back(dx, dy),
                 // The edge stays shut while an app fills the peer's screen: no glow, and the
                 // pointer stays here. The shortcut still switches.
-                State::Local if !self.cfg.paused && self.can_drive() && !(self.link.is_some() && self.peer_busy) => {
+                State::Local if !self.cfg.paused && self.can_drive() && !self.lands_in_busy(x, y) => {
                     if let Some(pos) = self.push(false, x, y, dx, dy, dragging) {
                         if self.link.is_some() {
                             self.drive(self.cfg.layout.to_peer(pos));
@@ -819,7 +819,16 @@ impl Core {
     }
 
     /// Whether an app fills the screen here, asked at most a few times a second.
-    fn fullscreen(&mut self) -> bool {
+    /// True when crossing at (x, y) would land inside a full-screen app on the peer. With the
+    /// peer's screens not known yet, any full-screen app there counts.
+    fn lands_in_busy(&self, x: i32, y: i32) -> bool {
+        let Some(busy) = self.peer_busy.filter(|_| self.link.is_some()) else { return false };
+        let layout = self.cfg.layout;
+        let pos = layout.to_peer(crossing::pos_along(&self.displays, layout.edge, x, y));
+        crossing::entry_point(&self.peer_displays, layout.edge.opposite(), pos).is_none_or(|(px, py)| busy.contains(px, py))
+    }
+
+    fn fullscreen(&mut self) -> Option<Rect> {
         if self.fullscreen.0.elapsed() >= Duration::from_millis(300) {
             self.fullscreen = (Instant::now(), self.os.fullscreen());
         }
@@ -831,8 +840,8 @@ impl Core {
     fn push(&mut self, back: bool, x: i32, y: i32, dx: i32, dy: i32, dragging: bool) -> Option<u16> {
         let layout = self.cfg.layout;
         // A corner takes a push into the corner itself; a full-screen app keeps the edge for itself.
-        let blocked =
-            (layout.corner && !layout.corner_push(&self.displays, x, y, dx, dy)) || (!back && self.cfg.fullscreen && self.fullscreen());
+        let blocked = (layout.corner && !layout.corner_push(&self.displays, x, y, dx, dy))
+            || (!back && self.cfg.fullscreen && self.fullscreen().is_some_and(|r| r.contains(x, y)));
         let crossing = if back { &mut self.back } else { &mut self.out };
         let edge = crossing.edge;
         let push = if blocked {

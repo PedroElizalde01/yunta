@@ -58,9 +58,10 @@ pub enum Msg {
         fingers: u8,
         direction: u8,
     },
-    /// An app fills the sender's screen: its edge is not to be crossed into, though the
-    /// shortcut may still switch. Sent on link up and whenever that changes.
-    Busy(bool),
+    /// A focused app fills this part of the sender's screens: the pointer is not to cross into
+    /// it at the edge, though the shortcut may still switch. None when there is none. Sent on
+    /// link up and whenever it changes.
+    Busy(Option<Rect>),
     /// The sender's own mouse moved while the receiver was driving it: the receiver stops
     /// driving and puts its pointer back where it left, quietly.
     TakeBack,
@@ -124,7 +125,14 @@ impl Msg {
                 out.extend_from_slice(name.as_bytes());
             }
             Msg::Gesture { fingers, direction } => out.extend_from_slice(&[12, *fingers, *direction]),
-            Msg::Busy(busy) => out.extend_from_slice(&[13, *busy as u8]),
+            Msg::Busy(busy) => {
+                out.push(13);
+                if let Some(r) = busy {
+                    for v in [r.x, r.y, r.w, r.h] {
+                        out.extend_from_slice(&v.to_be_bytes());
+                    }
+                }
+            }
             Msg::TakeBack => out.push(14),
         }
         out
@@ -174,7 +182,11 @@ impl Msg {
                 (Msg::Hello { receive: bool_at(0)?, name }, r.len())
             }
             12 if *r.get(1)? < 4 => (Msg::Gesture { fingers: *r.first()?, direction: r[1] }, 2),
-            13 => (Msg::Busy(bool_at(0)?), 1),
+            13 if r.is_empty() => (Msg::Busy(None), 0),
+            13 => {
+                let at = |i: usize| Some(i32::from_be_bytes(r.get(i..i + 4)?.try_into().ok()?));
+                (Msg::Busy(Some(Rect { x: at(0)?, y: at(4)?, w: at(8)?, h: at(12)? })), 16)
+            }
             14 => (Msg::TakeBack, 0),
             _ => return None,
         };
@@ -204,7 +216,8 @@ mod tests {
             Msg::Layout(Layout { edge: Edge::Left, ours: (0, 0), theirs: (65535, 65535), stamp: 1, corner: true }),
             Msg::Hello { receive: false, name: "Pedro's laptop".into() },
             Msg::Gesture { fingers: 3, direction: 1 },
-            Msg::Busy(true),
+            Msg::Busy(None),
+            Msg::Busy(Some(Rect { x: -1920, y: 0, w: 1920, h: 1080 })),
             Msg::TakeBack,
         ];
         for m in all {

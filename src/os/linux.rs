@@ -177,15 +177,20 @@ impl Os {
         if keyboard { self.grab_keyboard() } else { self.grab_pointer() }
     }
 
-    /// True when the focused window is full screen, as a game or a film is.
-    pub fn fullscreen(&self) -> bool {
+    /// Where the focused window is, when it is full screen, as a game or a film is.
+    pub fn fullscreen(&self) -> Option<Rect> {
         let [active, state, fullscreen] = self.atoms;
         let prop = |window: u32, name: u32| {
             self.conn.get_property(false, window, name, xproto::AtomEnum::ANY, 0, 64).ok().and_then(|c| c.reply().ok())
         };
-        let Some(window) = prop(self.root, active).and_then(|r| r.value32().and_then(|mut v| v.next())) else { return false };
-        window != NONE
-            && prop(window, state).and_then(|r| r.value32().map(|v| v.collect::<Vec<_>>())).is_some_and(|s| s.contains(&fullscreen))
+        let window = prop(self.root, active).and_then(|r| r.value32().and_then(|mut v| v.next())).filter(|w| *w != NONE)?;
+        let states: Vec<u32> = prop(window, state).and_then(|r| r.value32().map(|v| v.collect()))?;
+        if !states.contains(&fullscreen) {
+            return None;
+        }
+        let size = self.conn.get_geometry(window).ok()?.reply().ok()?;
+        let at = self.conn.translate_coordinates(window, self.root, 0, 0).ok()?.reply().ok()?;
+        Some(Rect { x: at.dst_x.into(), y: at.dst_y.into(), w: size.width.into(), h: size.height.into() })
     }
 
     pub fn inject(&self, msg: &Msg) {

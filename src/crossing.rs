@@ -72,7 +72,7 @@ impl Rect {
             .collect()
     }
 
-    fn contains(&self, x: i32, y: i32) -> bool {
+    pub fn contains(&self, x: i32, y: i32) -> bool {
         x >= self.x && x < self.x + self.w && y >= self.y && y < self.y + self.h
     }
 }

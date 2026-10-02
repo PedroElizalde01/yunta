@@ -192,24 +192,25 @@ impl Os {
 
     /// True when the window in front fills its monitor, as a game or a film does. The desktop
     /// itself fills the screen too, and does not count.
-    pub fn fullscreen(&self) -> bool {
+    pub fn fullscreen(&self) -> Option<Rect> {
         unsafe {
             let window = GetForegroundWindow();
             if window.is_null() || window == GetShellWindow() || window == GetDesktopWindow() {
-                return false;
+                return None;
             }
             let mut class = [0u16; 32];
             let n = GetClassNameW(window, class.as_mut_ptr(), class.len() as i32).max(0) as usize;
             if matches!(String::from_utf16_lossy(&class[..n]).as_str(), "Progman" | "WorkerW") {
-                return false;
+                return None;
             }
             let mut rect: RECT = mem::zeroed();
             let mut info: MONITORINFO = mem::zeroed();
             info.cbSize = mem::size_of::<MONITORINFO>() as u32;
-            GetWindowRect(window, &mut rect) != 0
+            let full = GetWindowRect(window, &mut rect) != 0
                 && GetMonitorInfoW(MonitorFromWindow(window, MONITOR_DEFAULTTONEAREST), &mut info) != 0
                 && (rect.left, rect.top, rect.right, rect.bottom)
-                    == (info.rcMonitor.left, info.rcMonitor.top, info.rcMonitor.right, info.rcMonitor.bottom)
+                    == (info.rcMonitor.left, info.rcMonitor.top, info.rcMonitor.right, info.rcMonitor.bottom);
+            full.then(|| Rect { x: rect.left, y: rect.top, w: rect.right - rect.left, h: rect.bottom - rect.top })
         }
     }
 
