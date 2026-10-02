@@ -36,7 +36,7 @@ use windows_sys::Win32::UI::WindowsAndMessaging::{
     GetWindowRect, HICON, HWND_TOPMOST, KBDLLHOOKSTRUCT, LLKHF_EXTENDED, LLKHF_INJECTED, LLMHF_INJECTED, LWA_ALPHA, MF_CHECKED, MF_GRAYED,
     MF_SEPARATOR, MF_STRING, MSG, MSLLHOOKSTRUCT, PM_REMOVE, PeekMessageW, PostMessageW, RegisterClassW, SM_CXCURSOR, SM_CXSCREEN,
     SM_CXVIRTUALSCREEN, SM_CYCURSOR, SM_CYSCREEN, SM_CYVIRTUALSCREEN, SM_XVIRTUALSCREEN, SM_YVIRTUALSCREEN, SPI_SETCURSORS, SW_HIDE,
-    SW_SHOWNOACTIVATE, SWP_HIDEWINDOW, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SWP_NOZORDER, SWP_SHOWWINDOW, SetCursor, SetCursorPos,
+    SW_SHOWNOACTIVATE, SWP_HIDEWINDOW, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SWP_NOZORDER, SWP_SHOWWINDOW, SetCursorPos,
     SetForegroundWindow, SetLayeredWindowAttributes, SetWindowPos, SetWindowsHookExW, ShowWindow, SystemParametersInfoW, TPM_NONOTIFY,
     TPM_RETURNCMD, TPM_RIGHTBUTTON, TrackPopupMenu, ULW_ALPHA, UpdateLayeredWindow, WH_KEYBOARD_LL, WH_MOUSE_LL, WM_APP, WM_INPUT,
     WM_KEYDOWN, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MBUTTONDOWN, WM_MBUTTONUP, WM_MOUSEHWHEEL, WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_RBUTTONDOWN,
@@ -66,10 +66,7 @@ static TRAY: Mutex<(Look, String)> = Mutex::new((Look::Waiting, String::new()));
 
 const WM_TRAY_CLICK: u32 = WM_APP + 1;
 const WM_TRAY_SHOW: u32 = WM_APP + 2;
-const WM_HIDE_POINTER: u32 = WM_APP + 3;
-const WM_SHOW_POINTER: u32 = WM_APP + 4;
 static HIDER: AtomicPtr<c_void> = AtomicPtr::new(ptr::null_mut());
-static BLANK: AtomicPtr<c_void> = AtomicPtr::new(ptr::null_mut());
 
 /// Output goes to the terminal that started us, if any. Nothing appears otherwise.
 pub fn attach_console() {
@@ -164,12 +161,12 @@ impl Os {
             let (x, y) = unsafe { (GetSystemMetrics(SM_CXSCREEN) / 2, GetSystemMetrics(SM_CYSCREEN) / 2) };
             PARK.0.store(x, Ordering::Relaxed);
             PARK.1.store(y, Ordering::Relaxed);
+            // The hider goes first, so the cursor is blank from the moment it lands there.
+            hide_pointer(true);
             unsafe { SetCursorPos(x, y) };
         }
-        if GRABBED.swap(on, Ordering::Relaxed) != on {
-            // The hider belongs to the input thread, so it is moved there.
-            let message = if on { WM_HIDE_POINTER } else { WM_SHOW_POINTER };
-            unsafe { PostMessageW(WINDOW.load(Ordering::Relaxed), message, 0, 0) };
+        if GRABBED.swap(on, Ordering::Relaxed) != on && !on {
+            hide_pointer(false);
         }
         true
     }
@@ -363,7 +360,6 @@ fn make_hider(module: windows_sys::Win32::Foundation::HINSTANCE) -> HWND {
         let bytes = (h * ((w + 15) / 16) * 2) as usize;
         let (and, xor) = (vec![0xFFu8; bytes], vec![0u8; bytes]);
         let blank = CreateCursor(module, 0, 0, w, h, and.as_ptr().cast(), xor.as_ptr().cast());
-        BLANK.store(blank, Ordering::Relaxed);
         let class: Vec<u16> = "yunta-hider\0".encode_utf16().collect();
         let wc = WNDCLASSW {
             lpfnWndProc: Some(DefWindowProcW),
@@ -384,7 +380,9 @@ fn make_hider(module: windows_sys::Win32::Foundation::HINSTANCE) -> HWND {
     }
 }
 
-/// Shows the hider under the parked cursor, or takes it away. Runs on the input thread.
+/// Shows the hider under the parked cursor, or takes it away. From any thread: Windows hands
+/// the move to the input thread, which owns the window, and waits for it. Once the cursor sits
+/// on the hider, Windows asks it for a cursor and gets the blank one.
 fn hide_pointer(hide: bool) {
     let hider = HIDER.load(Ordering::Relaxed);
     if hider.is_null() {
@@ -394,8 +392,6 @@ fn hide_pointer(hide: bool) {
         if hide {
             let (x, y) = (PARK.0.load(Ordering::Relaxed), PARK.1.load(Ordering::Relaxed));
             SetWindowPos(hider, HWND_TOPMOST, x, y, 1, 1, SWP_NOACTIVATE | SWP_SHOWWINDOW);
-            // The shape otherwise changes only on the next move, which the hook swallows.
-            SetCursor(BLANK.load(Ordering::Relaxed));
         } else {
             SetWindowPos(hider, ptr::null_mut(), 0, 0, 0, 0, SWP_HIDEWINDOW | SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE);
         }
@@ -465,8 +461,6 @@ fn emit(event: Event) {
 unsafe extern "system" fn window_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
     match msg {
         WM_TRAY_SHOW => show_tray(hwnd),
-        WM_HIDE_POINTER => hide_pointer(true),
-        WM_SHOW_POINTER => hide_pointer(false),
         // A click opens the settings, as tray icons do on Windows; a right click the menu.
         WM_TRAY_CLICK if lparam as u32 == WM_LBUTTONUP => crate::open_settings(None),
         WM_TRAY_CLICK if lparam as u32 == WM_RBUTTONUP => tray_menu(hwnd),
@@ -479,7 +473,7 @@ unsafe extern "system" fn window_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lpar
         let mut p = POINT { x: 0, y: 0 };
         let held = |vk: u16| unsafe { GetAsyncKeyState(vk as i32) } < 0;
         unsafe { GetCursorPos(&mut p) };
-        emit(Event::Motion { x: p.x, y: p.y, dx, dy, dragging: held(VK_LBUTTON) || held(VK_RBUTTON) || held(VK_MBUTTON) });
+        emit(Event::Motion { x: p.x, y: p.y, dx, dy, dragging: held(VK_LBUTTON) || held(VK_RBUTTON) || held(VK_MBUTTON), grabbed: false });
     }
     unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) }
 }
@@ -532,7 +526,7 @@ unsafe extern "system" fn mouse_proc(code: i32, wparam: WPARAM, lparam: LPARAM) 
             let event = match msg {
                 WM_MOUSEMOVE => {
                     let (dx, dy) = (m.pt.x - PARK.0.load(Ordering::Relaxed), m.pt.y - PARK.1.load(Ordering::Relaxed));
-                    (dx != 0 || dy != 0).then_some(Event::Motion { x: 0, y: 0, dx, dy, dragging: false })
+                    (dx != 0 || dy != 0).then_some(Event::Motion { x: 0, y: 0, dx, dy, dragging: false, grabbed: true })
                 }
                 WM_LBUTTONDOWN | WM_LBUTTONUP => Some(Event::Button { button: 1, down }),
                 WM_RBUTTONDOWN | WM_RBUTTONUP => Some(Event::Button { button: 2, down }),

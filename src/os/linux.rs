@@ -368,7 +368,7 @@ fn capture(conn: Arc<RustConnection>, root: u32, grabbed: Arc<AtomicBool>, tx: m
                 }
                 let (dx, dy) = (dx as i32, dy as i32);
                 if grabbed {
-                    Some(Event::Motion { x: 0, y: 0, dx, dy, dragging: false })
+                    Some(Event::Motion { x: 0, y: 0, dx, dy, dragging: false, grabbed: true })
                 } else {
                     // ponytail: one round trip per motion event, fine at 1000Hz on a local X server
                     pointer(&conn, root).map(|p| Event::Motion {
@@ -378,6 +378,7 @@ fn capture(conn: Arc<RustConnection>, root: u32, grabbed: Arc<AtomicBool>, tx: m
                         dy,
                         // Button1Mask to Button3Mask.
                         dragging: u16::from(p.mask) & 0x0700 != 0,
+                        grabbed: false,
                     })
                 }
             }

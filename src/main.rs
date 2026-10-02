@@ -55,6 +55,8 @@ pub enum Event {
         dx: i32,
         dy: i32,
         dragging: bool,
+        /// Measured under the grab, so x and y mean nothing: only counts while driving.
+        grabbed: bool,
     },
     Key {
         hid: u16,
@@ -566,8 +568,10 @@ impl Core {
 
     fn local(&mut self, event: Event) {
         match event {
-            Event::Motion { x, y, dx, dy, dragging } => match self.state {
+            Event::Motion { x, y, dx, dy, dragging, grabbed } => match self.state {
                 State::Driving => self.send(Msg::Move { dx: clamp16(dx), dy: clamp16(dy) }),
+                // Still queued from the grab after coming home: its (0, 0) is no place to push from.
+                _ if grabbed => {}
                 // Our moves while driven are warps (X11) or marked as ours (Windows), so motion
                 // seen here is this computer's own mouse.
                 State::Driven => self.take_back(dx, dy),
@@ -818,7 +822,6 @@ impl Core {
         }
     }
 
-    /// Whether an app fills the screen here, asked at most a few times a second.
     /// True when crossing at (x, y) would land inside a full-screen app on the peer. With the
     /// peer's screens not known yet, any full-screen app there counts.
     fn lands_in_busy(&self, x: i32, y: i32) -> bool {
@@ -828,6 +831,7 @@ impl Core {
         crossing::entry_point(&self.peer_displays, layout.edge.opposite(), pos).is_none_or(|(px, py)| busy.contains(px, py))
     }
 
+    /// Where an app fills the screen here, asked at most a few times a second.
     fn fullscreen(&mut self) -> Option<Rect> {
         if self.fullscreen.0.elapsed() >= Duration::from_millis(300) {
             self.fullscreen = (Instant::now(), self.os.fullscreen());
