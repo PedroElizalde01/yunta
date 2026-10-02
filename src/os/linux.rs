@@ -90,8 +90,22 @@ impl Os {
             atoms,
         };
         let (grabbed2, tx2) = (grabbed.clone(), tx.clone());
+        let (grabbed3, watched) = (grabbed.clone(), grab_conn.clone());
         std::thread::spawn(move || capture(conn, root, grabbed, tx));
         std::thread::spawn(move || grabbed_input(grab_conn, grabbed2, tx2));
+        // The core hung while we hold the keyboard and mouse: let go, so this computer stays usable.
+        std::thread::spawn(move || {
+            loop {
+                std::thread::sleep(std::time::Duration::from_secs(1));
+                if grabbed3.load(Ordering::Relaxed) && crate::core_silent() > crate::WATCHDOG {
+                    let _ = watched.ungrab_keyboard(CURRENT_TIME);
+                    let _ = watched.ungrab_pointer(CURRENT_TIME);
+                    let _ = watched.flush();
+                    grabbed3.store(false, Ordering::Relaxed);
+                    log!("the app stopped answering while driving: giving the keyboard and mouse back");
+                }
+            }
+        });
         Ok(os)
     }
 
@@ -109,6 +123,10 @@ impl Os {
 
     pub fn cursor(&self) -> (i32, i32) {
         pointer(&self.conn, self.root).map_or((0, 0), |p| (p.root_x.into(), p.root_y.into()))
+    }
+
+    pub fn is_grabbed(&self) -> bool {
+        self.grabbed.load(Ordering::Relaxed)
     }
 
     /// X11 has no mouse hook to count for the log.

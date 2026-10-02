@@ -29,7 +29,7 @@ Package: yunta
 Version: $version
 Architecture: amd64
 Maintainer: Pedro Elizalde
-Depends: libc6, libgl1, libegl1, libx11-6, libx11-xcb1, libxcursor1, libxi6, libxrandr2, libxkbcommon-x11-0
+Depends: libc6, curl, pkexec | policykit-1, libgl1, libegl1, libx11-6, libx11-xcb1, libxcursor1, libxi6, libxrandr2, libxkbcommon-x11-0
 Description: One keyboard and mouse for two computers on the same network
  Push the pointer through the edge of the screen, or double-tap Right Ctrl, and
  input carries on onto the other machine, with the clipboard. X11 only.

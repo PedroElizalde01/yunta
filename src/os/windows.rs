@@ -174,6 +174,10 @@ impl Os {
         true
     }
 
+    pub fn is_grabbed(&self) -> bool {
+        GRABBED.load(Ordering::Relaxed)
+    }
+
     /// Mouse moves the hook saw while grabbed, and how many stood still, since last asked.
     pub fn hook_stats(&self) -> (u32, u32) {
         (HOOK_MOVES.swap(0, Ordering::Relaxed), HOOK_STILL.swap(0, Ordering::Relaxed))
@@ -504,7 +508,17 @@ fn raw_motion(lparam: LPARAM) -> Option<(i32, i32)> {
 }
 
 /// Every key goes to the core, for the double-tap. While grabbed, none reaches Windows.
+/// The core hung while we hold the keyboard and mouse: let go, so this PC stays usable.
+fn watchdog() {
+    if GRABBED.load(Ordering::Relaxed) && crate::core_silent() > crate::WATCHDOG {
+        GRABBED.store(false, Ordering::Relaxed);
+        hide_pointer(false);
+        log!("the app stopped answering while driving: giving this PC's keyboard and mouse back");
+    }
+}
+
 unsafe extern "system" fn keyboard_proc(code: i32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
+    watchdog();
     if code >= 0 {
         let k = unsafe { &*(lparam as *const KBDLLHOOKSTRUCT) };
         if k.flags & LLKHF_INJECTED == 0 {
@@ -525,6 +539,7 @@ unsafe extern "system" fn keyboard_proc(code: i32, wparam: WPARAM, lparam: LPARA
 
 /// Only while grabbed: everything the mouse does goes to the core instead of Windows.
 unsafe extern "system" fn mouse_proc(code: i32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
+    watchdog();
     if code >= 0 && GRABBED.load(Ordering::Relaxed) {
         let m = unsafe { &*(lparam as *const MSLLHOOKSTRUCT) };
         if m.flags & LLMHF_INJECTED == 0 {

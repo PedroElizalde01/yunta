@@ -228,6 +228,9 @@ impl App {
             forget_asked: Instant::now(),
         };
         app.refresh();
+        if crate::wayland() {
+            app.error = Some("This is a Wayland session. Yunta needs X11: log out, pick \"Ubuntu on Xorg\" or similar at the login screen, and log in again.".into());
+        }
         if app.cfg.updates {
             app.check_updates();
         }

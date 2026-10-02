@@ -169,6 +169,9 @@ enum Role {
 fn run() -> io::Result<()> {
     let mut cfg = config::init()?;
     log::start(&cfg.path, "app");
+    if wayland() {
+        log!("this is a Wayland session: Yunta needs X11 to see and take over the keyboard and mouse, so it will not work here");
+    }
     update::tidy();
     let _ = std::fs::remove_file(config::quit_path(&cfg.path));
     // Held until we exit: a second copy would open a second link, or fight over the input.
@@ -361,6 +364,7 @@ impl Core {
     }
 
     fn run(mut self, rx: mpsc::Receiver<Input>) {
+        beat();
         self.show_status();
         self.write_status();
         loop {
@@ -377,6 +381,12 @@ impl Core {
                 Ok(input) => self.handle(input),
                 Err(mpsc::RecvTimeoutError::Timeout) => {}
                 Err(mpsc::RecvTimeoutError::Disconnected) => return,
+            }
+            beat();
+            // The watchdog let go while we hung: input is back here, so we are too.
+            if self.state == State::Driving && !self.os.is_grabbed() {
+                log!("the keyboard and mouse were given back while driving: coming home");
+                self.come_home(None);
             }
             if self.tap.tick(self.now()) {
                 self.switch();
@@ -1002,6 +1012,32 @@ fn release(held: &mut Vec<Msg>) -> Vec<Msg> {
             m => m,
         })
         .collect()
+}
+
+/// When the core last went round its loop, in milliseconds since `CLOCK` started.
+static BEAT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static CLOCK: std::sync::OnceLock<Instant> = std::sync::OnceLock::new();
+/// A core silent this long while driving is taken to be stuck, and the OS layer gives this
+/// computer's keyboard and mouse back on its own, rather than leave them held.
+pub const WATCHDOG: Duration = Duration::from_secs(5);
+
+fn clock_ms() -> u64 {
+    CLOCK.get_or_init(Instant::now).elapsed().as_millis() as u64
+}
+
+/// The core is alive.
+fn beat() {
+    BEAT.store(clock_ms(), std::sync::atomic::Ordering::Relaxed);
+}
+
+/// How long since the core last went round its loop.
+pub fn core_silent() -> Duration {
+    Duration::from_millis(clock_ms().saturating_sub(BEAT.load(std::sync::atomic::Ordering::Relaxed)))
+}
+
+/// A Linux desktop on Wayland, where no app may watch or take over global input.
+pub fn wayland() -> bool {
+    cfg!(target_os = "linux") && std::env::var("XDG_SESSION_TYPE").is_ok_and(|t| t == "wayland")
 }
 
 fn modified(path: &Path) -> Option<SystemTime> {
