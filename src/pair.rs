@@ -243,6 +243,10 @@ fn serve(mut stream: TcpStream, code: &str, public: &[u8], name: &str) -> io::Re
 
 /// The side where the code is typed (SPAKE2's A).
 fn join(addr: SocketAddr, code: &str, public: &[u8], name: &str) -> io::Result<Peer> {
+    // Pairing stays on the local network: an address typed by hand off it is never dialled.
+    if !link::is_lan(addr.ip()) {
+        return Err(io::Error::new(io::ErrorKind::InvalidInput, "that address is not on the local network"));
+    }
     let mut stream = TcpStream::connect_timeout(&addr, TIMEOUT)?;
     stream.set_read_timeout(Some(TIMEOUT))?;
     stream.set_write_timeout(Some(TIMEOUT))?;
@@ -379,6 +383,12 @@ mod tests {
         let (host, joined) = attempt("123456");
         assert_eq!(host.unwrap(), (vec![2; 32], "joiner".to_string()));
         assert_eq!(joined.unwrap(), (vec![1; 32], "host".to_string()));
+    }
+
+    #[test]
+    fn never_pairs_off_the_lan() {
+        let e = join(SocketAddr::from(([8, 8, 8, 8], PORT)), "123456", &[2; 32], "joiner").unwrap_err();
+        assert_eq!(e.kind(), io::ErrorKind::InvalidInput);
     }
 
     #[test]
