@@ -169,6 +169,11 @@ impl Crossing {
             self.pressure = 0;
             return Push::None;
         }
+        // A first push has to go outwards: sliding along the edge keeps a push built up, but never
+        // starts one, so with no resistance at all a move along the edge still does not cross.
+        if push == 0 && self.pressure == 0 {
+            return Push::None;
+        }
         self.pressure += push;
         if self.pressure < self.resistance {
             return Push::Building(self.pressure as f32 / self.resistance.max(1) as f32);
@@ -318,6 +323,14 @@ mod tests {
         assert_eq!(c.motion(&[A], 1919, 540, 60, 0, false), Push::Building(0.5));
         assert_eq!(c.motion(&[A], 1919, 540, 60, 0, false), Push::Cross(pos_along(&[A], Edge::Right, 0, 540)));
         assert_eq!(c.motion(&[A], 1919, 540, 500, 0, true), Push::None); // a drag never crosses
+    }
+
+    #[test]
+    fn no_resistance_still_needs_an_outward_push() {
+        let mut c = Crossing::new(Edge::Right, 0);
+        assert_eq!(c.motion(&[A], 1919, 540, 0, 7, false), Push::None); // along the edge
+        assert_eq!(c.motion(&[A], 1919, 540, -3, 0, false), Push::None); // inwards
+        assert!(matches!(c.motion(&[A], 1919, 540, 1, 0, false), Push::Cross(_))); // outwards
     }
 
     #[test]
