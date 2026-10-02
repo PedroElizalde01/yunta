@@ -14,7 +14,7 @@ if [ -n "$(git status --porcelain --untracked-files=no)" ]; then
 fi
 if git rev-parse -q --verify "refs/tags/$tag" >/dev/null; then
     # The tag may sit on an earlier commit, as long as nothing that goes into the build changed.
-    if ! git diff --quiet "$tag" HEAD -- src assets build.rs Cargo.toml Cargo.lock package.sh; then
+    if ! git diff --quiet "$tag" HEAD -- src assets build.rs .cargo Cargo.toml Cargo.lock package.sh; then
         echo "$tag exists and the code changed since: raise the version in Cargo.toml." >&2
         exit 1
     fi
