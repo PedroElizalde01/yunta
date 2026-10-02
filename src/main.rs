@@ -144,9 +144,7 @@ pub fn open_settings(page: Option<&str>) {
 fn pair() -> io::Result<()> {
     let cfg = config::init()?;
     let paired = pair::run(&cfg.public, &cfg.display_name())?;
-    config::set(&cfg.path, "peer_key", Some(&config::hex(&paired.peer_key)))?;
-    config::set(&cfg.path, "peer", paired.dialer.then(|| paired.addr.to_string()).as_deref())?;
-    config::set(&cfg.path, "peer_name", Some(&paired.name))?;
+    config::use_device(&cfg.path, &cfg, paired.device())?;
     println!("\nPaired with {} ({}). Start `yunta` on both machines.", paired.name, paired.addr);
     Ok(())
 }
@@ -445,6 +443,16 @@ impl Core {
         })
     }
 
+    /// Updates the entry for the computer in use in the list of paired ones, and saves it.
+    fn note_device(&mut self, change: impl FnOnce(&mut config::Device)) {
+        let Some(key) = self.cfg.peer_key.clone() else { return };
+        let Some(device) = self.cfg.devices.iter_mut().find(|d| d.key == key) else { return };
+        change(device);
+        if let Err(e) = config::save_devices(&self.cfg.path, &self.cfg.devices) {
+            eprintln!("devices: {e}");
+        }
+    }
+
     fn hello(&mut self) {
         self.send(Msg::Hello { receive: self.cfg.receive, name: self.cfg.display_name() });
     }
@@ -502,6 +510,11 @@ impl Core {
                         eprintln!("peer_mac: {e}");
                     }
                 }
+                let mac = self.cfg.peer_mac;
+                self.note_device(|d| {
+                    d.seen = now_ms();
+                    d.mac = mac.or(d.mac);
+                });
                 self.show_status();
             }
             Input::Down => {
@@ -685,6 +698,7 @@ impl Core {
                     if let Err(e) = config::set(&self.cfg.path, "peer_name", Some(&name)) {
                         eprintln!("peer_name: {e}");
                     }
+                    self.note_device(|d| d.name = name.clone());
                     self.cfg.peer_name = Some(name);
                 }
                 self.show_status();

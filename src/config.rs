@@ -58,6 +58,39 @@ pub struct Config {
     pub updates: bool,
     /// A new value asks the running app to start again, as after an update.
     pub restart: u64,
+    /// Every computer paired with, the one in use among them.
+    pub devices: Vec<Device>,
+}
+
+/// A computer paired with: one `device =` line each, fields split by `|`.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Device {
+    pub key: Vec<u8>,
+    pub name: String,
+    /// Its address, when this computer is the one that connects to it.
+    pub addr: Option<String>,
+    /// When they were last connected, in Unix milliseconds; 0 for never.
+    pub seen: u64,
+    pub mac: Option<[u8; 6]>,
+}
+
+impl Device {
+    fn line(&self) -> String {
+        let mac = self.mac.map(|m| mac_text(&m)).unwrap_or_default();
+        format!("{} | {} | {} | {} | {mac}", hex(&self.key), self.name, self.addr.as_deref().unwrap_or(""), self.seen)
+    }
+
+    fn parse(v: &str) -> Option<Device> {
+        let f: Vec<&str> = v.split('|').map(str::trim).collect();
+        let [key, name, addr, seen, mac] = f[..] else { return None };
+        Some(Device {
+            key: unhex(key).filter(|k| k.len() == 32)?,
+            name: name.to_string(),
+            addr: (!addr.is_empty()).then(|| addr.to_string()),
+            seen: seen.parse().ok()?,
+            mac: if mac.is_empty() { None } else { Some(parse_mac(mac)?) },
+        })
+    }
 }
 
 /// The groups `keep` may name.
@@ -147,6 +180,7 @@ fn parse(path: PathBuf, text: &str) -> io::Result<Config> {
         peer_mac: None,
         updates: true,
         restart: 0,
+        devices: vec![],
     };
     for (n, line) in text.lines().enumerate() {
         let line = line.split('#').next().unwrap_or("").trim();
@@ -205,6 +239,9 @@ fn parse(path: PathBuf, text: &str) -> io::Result<Config> {
             "name" => cfg.name = Some(v.to_string()),
             "peer_mac" => cfg.peer_mac = Some(parse_mac(v).ok_or_else(|| err("expected a hardware address like aa:bb:cc:dd:ee:ff"))?),
             "restart" => cfg.restart = v.parse().map_err(|_| err("expected a number"))?,
+            "device" => cfg
+                .devices
+                .push(Device::parse(v).ok_or_else(|| err("expected `device = key | name | address | last seen | hardware address`"))?),
             "theme" if ["system", "light", "dark"].contains(&v) => cfg.theme = v.to_string(),
             "theme" => return Err(err("expected system, light or dark")),
             "port" => cfg.port = v.parse().map_err(|_| err("expected a port number"))?,
@@ -234,6 +271,13 @@ fn parse(path: PathBuf, text: &str) -> io::Result<Config> {
             "hotkey" => cfg.hotkey = u16::from_str_radix(v.trim_start_matches("0x"), 16).map_err(|_| err("expected a HID usage in hex"))?,
             _ => return Err(err("unknown setting")),
         }
+    }
+    // Paired before there was a list: the one paired is its first entry.
+    if let Some(key) = &cfg.peer_key
+        && !cfg.devices.iter().any(|d| &d.key == key)
+    {
+        let name = cfg.peer_name.clone().unwrap_or_else(|| "The other computer".into());
+        cfg.devices.push(Device { key: key.clone(), name, addr: cfg.peer.clone(), seen: 0, mac: cfg.peer_mac });
     }
     if cfg.key.is_empty() || cfg.public.is_empty() {
         return Err(io::Error::new(io::ErrorKind::InvalidData, format!("{}: no key (run `yunta init`)", cfg.path.display())));
@@ -265,6 +309,40 @@ pub fn set(path: &Path, key: &str, value: Option<&str>) -> io::Result<()> {
     }
     // Written in place, so the file keeps its owner-only permissions.
     fs::write(path, out)
+}
+
+/// Writes the list of paired computers, in place of the one there.
+pub fn save_devices(path: &Path, devices: &[Device]) -> io::Result<()> {
+    let text = fs::read_to_string(path)?;
+    let mut out: String = text.lines().filter(|l| l.split('=').next().unwrap_or("").trim() != "device").map(|l| format!("{l}\n")).collect();
+    for d in devices {
+        out.push_str(&format!("device = {}\n", d.line()));
+    }
+    fs::write(path, out)
+}
+
+/// Adds `device` to the list, or updates its entry, and makes it the one in use.
+pub fn use_device(path: &Path, cfg: &Config, device: Device) -> io::Result<()> {
+    let mut devices: Vec<Device> = cfg.devices.iter().filter(|d| d.key != device.key).cloned().collect();
+    devices.insert(0, device.clone());
+    save_devices(path, &devices)?;
+    set(path, "peer_key", Some(&hex(&device.key)))?;
+    set(path, "peer", device.addr.as_deref())?;
+    set(path, "peer_name", Some(&device.name))?;
+    set(path, "peer_mac", device.mac.map(|m| mac_text(&m)).as_deref())
+}
+
+/// Drops `key` from the list. If it was the one in use, this computer is no longer paired, and
+/// that computer can no longer connect.
+pub fn forget_device(path: &Path, cfg: &Config, key: &[u8]) -> io::Result<()> {
+    let devices: Vec<Device> = cfg.devices.iter().filter(|d| d.key != key).cloned().collect();
+    save_devices(path, &devices)?;
+    if cfg.peer_key.as_deref() == Some(key) {
+        for k in ["peer_key", "peer", "peer_name", "peer_mac"] {
+            set(path, k, None)?;
+        }
+    }
+    Ok(())
 }
 
 /// The status file the running app keeps for the settings window, next to yunta.conf.
@@ -300,7 +378,7 @@ pub fn save_layout(path: &Path, l: &Layout) -> io::Result<()> {
 
 /// A name fit to save: no `#`, which starts a comment, no control characters, at most 48 long.
 pub fn clean_name(name: &str) -> String {
-    name.chars().filter(|c| *c != '#' && !c.is_control()).take(48).collect::<String>().trim().to_string()
+    name.chars().filter(|c| !matches!(c, '#' | '|') && !c.is_control()).take(48).collect::<String>().trim().to_string()
 }
 
 pub fn parse_mac(text: &str) -> Option<[u8; 6]> {
@@ -365,6 +443,27 @@ mod tests {
             assert!(parse("t".into(), &format!("{text}{bad}\n")).is_err(), "{bad}");
         }
         assert!(parse("t".into(), "edge = left\n").is_err()); // no key
+    }
+
+    #[test]
+    fn devices_are_remembered_switched_and_forgotten() {
+        let dir = std::env::temp_dir().join(format!("yunta-devices-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("yunta.conf");
+        let k = "ab".repeat(32);
+        // Paired the old way, with no list yet: the peer becomes the first device.
+        fs::write(&path, format!("key = {k}\npublic = {k}\npeer_key = {}\npeer_name = PC\npeer = 10.0.0.2\n", "cd".repeat(32))).unwrap();
+        let cfg = load_from(&path).unwrap();
+        assert_eq!((cfg.devices.len(), cfg.devices[0].name.as_str()), (1, "PC"));
+        let laptop = Device { key: vec![0xEF; 32], name: "Laptop".into(), addr: None, seen: 5, mac: Some([1, 2, 3, 4, 5, 6]) };
+        use_device(&path, &cfg, laptop.clone()).unwrap();
+        let cfg = load_from(&path).unwrap();
+        assert_eq!((cfg.devices.len(), cfg.peer_key.as_deref(), cfg.peer.as_deref()), (2, Some(&[0xEF; 32][..]), None));
+        assert_eq!(cfg.devices[0], laptop);
+        forget_device(&path, &cfg, &[0xEF; 32]).unwrap();
+        let cfg = load_from(&path).unwrap();
+        fs::remove_dir_all(&dir).unwrap();
+        assert_eq!((cfg.devices.len(), cfg.peer_key.is_none(), cfg.devices[0].name.as_str()), (1, true, "PC"));
     }
 
     #[test]

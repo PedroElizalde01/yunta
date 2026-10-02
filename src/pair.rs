@@ -43,6 +43,19 @@ pub struct Paired {
     pub dialer: bool,
 }
 
+impl Paired {
+    /// The new entry for the list of paired computers.
+    pub fn device(&self) -> crate::config::Device {
+        crate::config::Device {
+            key: self.peer_key.clone(),
+            name: crate::config::clean_name(&self.name),
+            addr: self.dialer.then(|| self.addr.to_string()),
+            seen: 0,
+            mac: None,
+        }
+    }
+}
+
 /// What happens in pairing mode, as `Mode::next` reports it.
 pub enum Event {
     /// Another machine in pairing mode.

@@ -171,6 +171,8 @@ struct App {
     /// When this window opened, and whether Yunta was quit from the tray since.
     opened: std::time::SystemTime,
     quit: bool,
+    /// The paired computer whose Forget is waiting for a second click.
+    forgetting: Option<Vec<u8>>,
 }
 
 /// Pairing mode in the window: the machines it found, and what was typed for each.
@@ -213,6 +215,7 @@ impl App {
             update: Arc::new(Mutex::new(Update::Idle)),
             opened: std::time::SystemTime::now(),
             quit: false,
+            forgetting: None,
         };
         app.refresh();
         if app.cfg.updates {
@@ -743,9 +746,7 @@ impl App {
                 // Over now, which closes its ports.
                 self.pairing = None;
                 let path = self.cfg.path.clone();
-                let saved = config::set(&path, "peer_key", Some(&config::hex(&paired.peer_key)))
-                    .and_then(|()| config::set(&path, "peer", paired.dialer.then(|| paired.addr.to_string()).as_deref()))
-                    .and_then(|()| config::set(&path, "peer_name", Some(&paired.name)));
+                let saved = config::use_device(&path, &self.cfg, paired.device());
                 self.paired = Some(match saved {
                     Ok(()) => (format!("Paired with {}.", paired.name), true),
                     Err(e) => (format!("Paired with {}, but could not save it: {e}", paired.name), false),
@@ -759,6 +760,84 @@ impl App {
                 self.refresh();
             }
         }
+    }
+
+    /// Every computer paired with: when each last connected, which is in use, and a way to switch
+    /// to another or forget one.
+    fn devices(&mut self, ui: &mut egui::Ui) {
+        if self.cfg.devices.is_empty() {
+            return;
+        }
+        enum Act {
+            Use(config::Device),
+            Ask(Vec<u8>),
+            Cancel,
+            Forget(config::Device),
+        }
+        let mut act = None;
+        let (in_use, asking) = (self.cfg.peer_key.clone(), self.forgetting.clone());
+        // The one in use first, then the most recently connected.
+        let mut devices = self.cfg.devices.clone();
+        devices.sort_by_key(|d| (in_use.as_ref() != Some(&d.key), std::cmp::Reverse(d.seen)));
+        section(ui, "Paired computers");
+        card(ui, |ui| {
+            let p = palette(ui);
+            for (i, d) in devices.iter().enumerate() {
+                let current = in_use.as_ref() == Some(&d.key);
+                let confirming = asking.as_ref() == Some(&d.key);
+                ui.horizontal(|ui| {
+                    widgets::avatar(ui, &d.name);
+                    ui.vertical(|ui| {
+                        ui.horizontal(|ui| {
+                            ui.label(bold(&d.name));
+                            if current {
+                                widgets::pill(ui, "In use", p.accent);
+                            }
+                        });
+                        let seen = if d.seen == 0 { "Never connected".to_string() } else { format!("Last connected {}", ago(d.seen)) };
+                        ui.label(RichText::new(format!("{seen} · key {}", fingerprint(&d.key))).size(12.0).color(p.weak));
+                    });
+                    ui.with_layout(Flow::right_to_left(Align::Center), |ui| {
+                        if confirming {
+                            if ui.add(egui::Button::new(RichText::new("Forget").color(Color32::WHITE)).fill(p.danger)).clicked() {
+                                act = Some(Act::Forget(d.clone()));
+                            }
+                            if ui.button("Cancel").clicked() {
+                                act = Some(Act::Cancel);
+                            }
+                        } else {
+                            if ui.button("Forget").clicked() {
+                                act = Some(Act::Ask(d.key.clone()));
+                            }
+                            if !current && ui.button("Use").clicked() {
+                                act = Some(Act::Use(d.clone()));
+                            }
+                        }
+                    });
+                });
+                if confirming {
+                    let note = format!("{} will no longer be able to connect. Forget this computer on {} too.", d.name, d.name);
+                    ui.label(RichText::new(note).size(12.0).color(p.danger));
+                }
+                if i + 1 < devices.len() {
+                    divider(ui);
+                }
+            }
+        });
+        let path = self.cfg.path.clone();
+        let done = match act {
+            None => return,
+            Some(Act::Ask(key)) => return self.forgetting = Some(key),
+            Some(Act::Cancel) => return self.forgetting = None,
+            Some(Act::Use(d)) => config::use_device(&path, &self.cfg, d.clone()).map(|()| format!("Now using {}.", d.name)),
+            Some(Act::Forget(d)) => config::forget_device(&path, &self.cfg, &d.key).map(|()| format!("Forgot {}.", d.name)),
+        };
+        self.forgetting = None;
+        self.paired = Some(match done {
+            Ok(note) => (note, true),
+            Err(e) => (format!("Could not change the paired computers: {e}"), false),
+        });
+        self.refresh();
     }
 
     fn pairing(&mut self, ui: &mut egui::Ui) {
@@ -792,6 +871,7 @@ impl App {
                     }
                 }
             });
+            self.devices(ui);
             return;
         };
         let mut stop = false;
@@ -1320,6 +1400,18 @@ fn key_name(hid: u16) -> String {
     }
 }
 
+/// How long ago `ms` (Unix milliseconds) was, in words.
+fn ago(ms: u64) -> String {
+    let secs = crate::now_ms().saturating_sub(ms) / 1000;
+    let (n, unit) = match secs {
+        0..60 => return "just now".into(),
+        60..3600 => (secs / 60, "minute"),
+        3600..86400 => (secs / 3600, "hour"),
+        _ => (secs / 86400, "day"),
+    };
+    format!("{n} {unit}{} ago", if n == 1 { "" } else { "s" })
+}
+
 /// What the other computer is called until pairing tells its name.
 const SOMEONE: &str = "the other computer";
 
@@ -1395,6 +1487,15 @@ mod tests {
         let saved = config::load_from(&path).unwrap().layout;
         std::fs::remove_dir_all(path.parent().unwrap()).unwrap();
         assert!(saved.corner && saved.edge == Edge::Right && saved.ours == (0, 0), "{saved:?}");
+    }
+
+    #[test]
+    fn says_how_long_ago() {
+        let now = crate::now_ms();
+        assert_eq!(ago(now), "just now");
+        assert_eq!(ago(now - 60_000), "1 minute ago");
+        assert_eq!(ago(now - 3 * 3_600_000), "3 hours ago");
+        assert_eq!(ago(now - 2 * 86_400_000), "2 days ago");
     }
 
     #[test]
