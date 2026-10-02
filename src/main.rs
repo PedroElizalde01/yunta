@@ -294,6 +294,9 @@ struct Core {
     rest: (f32, f32),
     /// When we last sent a wake-up.
     woke_at: Option<Instant>,
+    /// While driven, where we put the pointer. Kept here rather than read back: on Windows a
+    /// move is applied later, and reading the position at once can give the old one.
+    pointer: (i32, i32),
 }
 
 impl Core {
@@ -324,6 +327,7 @@ impl Core {
             fullscreen: (now - Duration::from_secs(1), false),
             rest: (0.0, 0.0),
             woke_at: None,
+            pointer: (0, 0),
             cfg,
         };
         core.apply_keep();
@@ -626,10 +630,9 @@ impl Core {
                 }
                 self.back = Crossing::new(edge, self.cfg.resistance);
                 self.rest = (0.0, 0.0);
-                if let Some((x, y)) = crossing::entry_point(&self.displays, edge, pos) {
-                    self.os.move_to(x, y);
-                    self.arrive(x, y);
-                }
+                self.pointer = crossing::entry_point(&self.displays, edge, pos).unwrap_or_else(|| self.os.cursor());
+                self.os.move_to(self.pointer.0, self.pointer.1);
+                self.arrive(self.pointer.0, self.pointer.1);
                 self.state = State::Driven;
             }
             Msg::Leave { pos } => match self.state {
@@ -647,8 +650,9 @@ impl Core {
                 let (dx, dy) = (fx.trunc(), fy.trunc());
                 self.rest = (fx - dx, fy - dy);
                 let (dx, dy) = (dx as i32, dy as i32);
-                let (x, y) = self.os.cursor();
+                let (x, y) = self.pointer;
                 let (x, y) = crossing::step_within(&self.displays, x, y, x + dx, y + dy);
+                self.pointer = (x, y);
                 self.os.move_to(x, y);
                 let dragging = self.held_here.iter().any(|m| matches!(m, Msg::Button { .. }));
                 if let Some(pos) = self.push(true, x, y, dx, dy, dragging) {
