@@ -6,7 +6,7 @@
 //! TLS code of its own.
 
 use std::io;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use ed25519_dalek::{Signature, VerifyingKey};
@@ -38,7 +38,8 @@ impl Release {
 
 /// The newest release, if it is newer than this build.
 pub fn check() -> io::Result<Option<Release>> {
-    let json = curl(&[&format!("https://api.github.com/repos/{REPO}/releases/latest"), "-H", "Accept: application/vnd.github+json"])?;
+    let url = format!("https://api.github.com/repos/{REPO}/releases/latest");
+    let json = curl(&[&url, "-H", "Accept: application/vnd.github+json"], JSON_MAX)?;
     let json = String::from_utf8_lossy(&json);
     let version = strings(&json, "tag_name").into_iter().next().ok_or_else(|| io::Error::other("no release found"))?;
     let version = version.trim_start_matches('v').to_string();
@@ -51,13 +52,11 @@ pub fn check() -> io::Result<Option<Release>> {
 /// on Windows the running copy is moved aside and the new one put in its place. Either way the
 /// app must be started again afterwards.
 pub fn install(release: &Release) -> io::Result<()> {
-    let dir = std::env::temp_dir().join(format!("yunta-update-{}", std::process::id()));
-    std::fs::create_dir_all(&dir)?;
-    let sums = curl(&[release.asset("SHA256SUMS")?])?;
-    let signature = curl(&[release.asset("SHA256SUMS.sig")?])?;
+    let sums = curl(&[release.asset("SHA256SUMS")?], SUMS_MAX)?;
+    let signature = curl(&[release.asset("SHA256SUMS.sig")?], SIG_MAX)?;
     verify(&sums, &signature)?;
     let name = release.package();
-    let package = curl(&[release.asset(&name)?])?;
+    let package = curl(&[release.asset(&name)?], PACKAGE_MAX)?;
     let want = String::from_utf8_lossy(&sums)
         .lines()
         .find_map(|l| l.split_once("  ").filter(|(_, file)| file.trim() == name).map(|(sum, _)| sum.to_string()))
@@ -65,9 +64,48 @@ pub fn install(release: &Release) -> io::Result<()> {
     if crate::config::hex(&Sha256::digest(&package)) != want {
         return Err(io::Error::other(format!("{name} does not match its checksum")));
     }
+    // A folder of our own that nobody else can enter, under a name nobody can guess, made
+    // fresh: on Linux the package is opened again by apt-get as root, and anyone able to swap it
+    // in between could install what they like.
+    let base = std::env::var_os("XDG_RUNTIME_DIR").map(PathBuf::from).filter(|d| d.is_dir()).unwrap_or_else(std::env::temp_dir);
+    let dir = private_dir(&base.join(format!("yunta-update-{}", crate::config::hex(&random_bytes()))))?;
     let file = dir.join(&name);
-    std::fs::write(&file, &package)?;
-    apply(&file)
+    let result = write_private(&file, &package).and_then(|()| apply(&file));
+    let _ = std::fs::remove_dir_all(&dir);
+    result
+}
+
+/// Most a download may be: past this it is not what it claims to be, and stops.
+const JSON_MAX: usize = 1024 * 1024;
+const SUMS_MAX: usize = 64 * 1024;
+const SIG_MAX: usize = 1024;
+const PACKAGE_MAX: usize = 64 * 1024 * 1024;
+
+fn random_bytes() -> [u8; 16] {
+    let mut bytes = [0u8; 16];
+    getrandom::fill(&mut bytes).expect("system RNG");
+    bytes
+}
+
+/// Makes `dir`, which must not exist yet, readable by this user alone.
+fn private_dir(dir: &Path) -> io::Result<PathBuf> {
+    #[cfg_attr(not(unix), allow(unused_mut))]
+    let mut builder = std::fs::DirBuilder::new();
+    #[cfg(unix)]
+    std::os::unix::fs::DirBuilderExt::mode(&mut builder, 0o700);
+    builder.create(dir)?;
+    Ok(dir.to_path_buf())
+}
+
+/// Writes a new file, never an existing one, readable by this user alone.
+fn write_private(file: &Path, bytes: &[u8]) -> io::Result<()> {
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    std::os::unix::fs::OpenOptionsExt::mode(&mut options, 0o600);
+    let mut f = options.open(file)?;
+    std::io::Write::write_all(&mut f, bytes)?;
+    f.sync_all()
 }
 
 #[cfg(target_os = "linux")]
@@ -119,17 +157,29 @@ fn verify(sums: &[u8], signature: &[u8]) -> io::Result<()> {
     key.verify_strict(sums, &signature).map_err(|_| bad())
 }
 
-fn curl(args: &[&str]) -> io::Result<Vec<u8>> {
+/// Downloads through curl, keeping at most `max` bytes: more than that and it stops.
+fn curl(args: &[&str], max: usize) -> io::Result<Vec<u8>> {
+    use std::io::Read;
     let mut cmd = Command::new(if cfg!(windows) { "curl.exe" } else { "curl" });
-    cmd.args(["-fsSL", "--max-time", "60", "--proto", "=https"]).args(args);
+    cmd.args(["-fsSL", "--max-time", "60", "--proto", "=https", "--max-filesize", &max.to_string()]).args(args);
+    cmd.stdout(std::process::Stdio::piped()).stderr(std::process::Stdio::piped());
     #[cfg(windows)]
     std::os::windows::process::CommandExt::creation_flags(&mut cmd, 0x0800_0000);
-    let out = cmd.output().map_err(|e| io::Error::new(e.kind(), format!("curl: {e}")))?;
-    if !out.status.success() {
-        let why = String::from_utf8_lossy(&out.stderr).trim().to_string();
+    let mut child = cmd.spawn().map_err(|e| io::Error::new(e.kind(), format!("curl: {e}")))?;
+    let mut body = Vec::new();
+    child.stdout.take().expect("piped").take(max as u64 + 1).read_to_end(&mut body)?;
+    if body.len() > max {
+        let _ = child.kill();
+        let _ = child.wait();
+        return Err(io::Error::other("the download is larger than it should be"));
+    }
+    let mut why = String::new();
+    child.stderr.take().expect("piped").read_to_string(&mut why)?;
+    if !child.wait()?.success() {
+        let why = why.trim().to_string();
         return Err(io::Error::other(if why.contains("404") { "no release published yet".to_string() } else { why }));
     }
-    Ok(out.stdout)
+    Ok(body)
 }
 
 /// Every string value of `key` in `json`. Enough for GitHub's release JSON, whose values here
@@ -161,6 +211,34 @@ mod tests {
         assert_eq!(strings(json, "tag_name"), vec!["v0.2.0"]);
         assert_eq!(strings(json, "browser_download_url").len(), 2);
         assert!(newer("0.2.0", "0.1.9") && newer("0.10.0", "0.9.0") && !newer("0.1.0", "0.1.0") && !newer("0.1.0", "0.2.0"));
+    }
+
+    /// Asks GitHub, for real: run by hand with `cargo test --release -- --ignored asks_github`.
+    #[test]
+    #[ignore]
+    fn asks_github() {
+        let url = format!("https://api.github.com/repos/{REPO}/releases/latest");
+        let json = curl(&[&url], JSON_MAX).unwrap();
+        assert!(!strings(&String::from_utf8_lossy(&json), "tag_name").is_empty());
+        assert!(curl(&[&url], 10).is_err()); // over the limit
+    }
+
+    #[test]
+    fn update_files_are_never_reused() {
+        let base = std::env::temp_dir().join(format!("yunta-private-{}", std::process::id()));
+        let dir = private_dir(&base).unwrap();
+        // A folder someone made first is refused, never written into.
+        assert!(private_dir(&base).is_err());
+        let file = dir.join("yunta.deb");
+        write_private(&file, b"one").unwrap();
+        assert!(write_private(&file, b"two").is_err());
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(std::fs::metadata(&dir).unwrap().permissions().mode() & 0o777, 0o700);
+            assert_eq!(std::fs::metadata(&file).unwrap().permissions().mode() & 0o777, 0o600);
+        }
+        std::fs::remove_dir_all(&base).unwrap();
     }
 
     #[test]
