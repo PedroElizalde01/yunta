@@ -7,7 +7,8 @@ repo=PedroElizalde01/yunta
 version=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -n1)
 tag="v$version"
 
-if [ -n "$(git status --porcelain)" ]; then
+# Untracked files never reach the build, so only changes to tracked ones count.
+if [ -n "$(git status --porcelain --untracked-files=no)" ]; then
     echo "Commit or stash your changes first: a release is built from a clean tree." >&2
     exit 1
 fi
