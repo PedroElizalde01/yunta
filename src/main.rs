@@ -156,7 +156,7 @@ pub fn open_settings(page: Option<&str>) {
 fn pair() -> io::Result<()> {
     let cfg = config::init()?;
     let paired = pair::run(&cfg.public, &cfg.display_name())?;
-    config::use_device(&cfg.path, &cfg, paired.device())?;
+    config::use_device(&cfg.path, paired.device())?;
     println!("\nPaired with {} ({}). Start `yunta` on both machines.", paired.name, paired.addr);
     Ok(())
 }
@@ -169,6 +169,9 @@ enum Role {
 fn run() -> io::Result<()> {
     let mut cfg = config::init()?;
     log::start(&cfg.path, "app");
+    if !cfg.unknown.is_empty() {
+        log!("yunta.conf has settings this version does not know, and skips: {}", cfg.unknown.join(", "));
+    }
     if wayland() {
         log!("this is a Wayland session: Yunta needs X11 to see and take over the keyboard and mouse, so it will not work here");
     }
@@ -501,13 +504,16 @@ impl Core {
         })
     }
 
-    /// Updates the entry for the computer in use in the list of paired ones, and saves it.
-    fn note_device(&mut self, change: impl FnOnce(&mut config::Device)) {
+    /// Saves what we learnt about the computer in use: `setting` (its hardware address or name)
+    /// and the same in its entry in the list of paired ones, in one write.
+    fn note_peer(&mut self, setting: (&str, &str), change: impl FnOnce(&mut config::Device)) {
         let Some(key) = self.cfg.peer_key.clone() else { return };
-        let Some(device) = self.cfg.devices.iter_mut().find(|d| d.key == key) else { return };
-        change(device);
-        if let Err(e) = config::save_devices(&self.cfg.path, &self.cfg.devices) {
-            log!("devices: {e}");
+        let saved = config::update(&self.cfg.path, |doc| {
+            doc.set(setting.0, Some(setting.1));
+            config::change_device(doc, &key, change)
+        });
+        if let Err(e) = saved {
+            log!("{}: {e}", setting.0);
         }
     }
 
@@ -563,19 +569,15 @@ impl Core {
                 self.busy = if self.cfg.fullscreen { self.fullscreen() } else { None };
                 self.send(Msg::Busy(self.busy));
                 // Fresh in the ARP table now, so this is the time to learn it for waking later.
-                if let Some(mac) = addr.and_then(wake::mac_of)
-                    && self.cfg.peer_mac != Some(mac)
-                {
+                if let Some(mac) = addr.and_then(wake::mac_of) {
                     self.cfg.peer_mac = Some(mac);
-                    if let Err(e) = config::set(&self.cfg.path, "peer_mac", Some(&config::mac_text(&mac))) {
-                        log!("peer_mac: {e}");
-                    }
                 }
-                let mac = self.cfg.peer_mac;
-                self.note_device(|d| {
-                    d.seen = now_ms();
-                    d.mac = mac.or(d.mac);
-                });
+                if let Some(mac) = self.cfg.peer_mac {
+                    self.note_peer(("peer_mac", &config::mac_text(&mac)), |d| {
+                        d.seen = now_ms();
+                        d.mac = Some(mac);
+                    });
+                }
                 self.show_status();
             }
             Input::Down => {
@@ -779,10 +781,7 @@ impl Core {
                 self.peer_receives = receive;
                 if self.cfg.peer_name.as_deref() != Some(name.as_str()) && !name.is_empty() {
                     let name = config::clean_name(&name);
-                    if let Err(e) = config::set(&self.cfg.path, "peer_name", Some(&name)) {
-                        log!("peer_name: {e}");
-                    }
-                    self.note_device(|d| d.name = name.clone());
+                    self.note_peer(("peer_name", &name), |d| d.name = name.clone());
                     self.cfg.peer_name = Some(name);
                 }
                 self.show_status();

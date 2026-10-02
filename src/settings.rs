@@ -228,6 +228,12 @@ impl App {
             forget_asked: Instant::now(),
         };
         app.refresh();
+        if !app.cfg.unknown.is_empty() {
+            app.error = Some(format!(
+                "yunta.conf has settings this version does not know, so they do nothing: {}. A newer version may have written them, or they are mistyped.",
+                app.cfg.unknown.join(", ")
+            ));
+        }
         if crate::wayland() {
             app.error = Some("This is a Wayland session. Yunta needs X11: log out, pick \"Ubuntu on Xorg\" or similar at the login screen, and log in again.".into());
         }
@@ -764,7 +770,7 @@ impl App {
                 // Over now, which closes its ports.
                 self.pairing = None;
                 let path = self.cfg.path.clone();
-                let saved = config::use_device(&path, &self.cfg, paired.device());
+                let saved = config::use_device(&path, paired.device());
                 self.paired = Some(match saved {
                     Ok(()) => (format!("Paired with {}.", paired.name), true),
                     Err(e) => (format!("Paired with {}, but could not save it: {e}", paired.name), false),
@@ -857,8 +863,8 @@ impl App {
                 return self.forgetting = Some(key);
             }
             Some(Act::Cancel) => return self.forgetting = None,
-            Some(Act::Use(d)) => config::use_device(&path, &self.cfg, d.clone()).map(|()| format!("Now using {}.", d.name)),
-            Some(Act::Forget(d)) => config::forget_device(&path, &self.cfg, &d.key).map(|()| format!("Forgot {}.", d.name)),
+            Some(Act::Use(d)) => config::use_device(&path, d.clone()).map(|()| format!("Now using {}.", d.name)),
+            Some(Act::Forget(d)) => config::forget_device(&path, &d.key).map(|()| format!("Forgot {}.", d.name)),
         };
         self.forgetting = None;
         self.paired = Some(match done {

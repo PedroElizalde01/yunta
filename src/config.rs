@@ -54,10 +54,13 @@ pub struct Config {
     pub wake: bool,
     /// The other computer's network card, for waking it. Learnt when they connect.
     pub peer_mac: Option<[u8; 6]>,
-    /// Look for a new version once a day.
+    /// Look for a new version each time the settings window opens.
     pub updates: bool,
     /// A new value asks the running app to start again, as after an update.
     pub restart: u64,
+    /// Settings this version does not know, as `name (line n)`: from a newer version, or mistyped.
+    /// Skipped, not refused, so going back a version still starts; the window shows them.
+    pub unknown: Vec<String>,
     /// Every computer paired with, the one in use among them.
     pub devices: Vec<Device>,
 }
@@ -99,7 +102,8 @@ pub const KEEP: [&str; 4] = ["volume", "media", "side_buttons", "print_screen"];
 impl Config {
     /// This computer's name: the one given in settings, or the system's.
     pub fn display_name(&self) -> String {
-        self.name.clone().unwrap_or_else(crate::pair::machine_name)
+        let name = self.name.clone().unwrap_or_else(|| clean_name(&crate::pair::machine_name()));
+        if name.is_empty() { "This computer".into() } else { name }
     }
 }
 
@@ -147,6 +151,14 @@ pub fn load() -> io::Result<Config> {
 
 pub fn load_from(path: &Path) -> io::Result<Config> {
     let path = path.to_path_buf();
+    // It holds this machine's private key: readable by this user alone, whatever happened to it.
+    #[cfg(unix)]
+    if let Ok(meta) = fs::metadata(&path) {
+        use std::os::unix::fs::PermissionsExt;
+        if meta.permissions().mode() & 0o077 != 0 {
+            let _ = fs::set_permissions(&path, fs::Permissions::from_mode(0o600));
+        }
+    }
     let text = fs::read_to_string(&path).map_err(|e| io::Error::new(e.kind(), format!("{}: {e} (run `yunta init`)", path.display())))?;
     parse(path, &text)
 }
@@ -180,6 +192,7 @@ fn parse(path: PathBuf, text: &str) -> io::Result<Config> {
         peer_mac: None,
         updates: true,
         restart: 0,
+        unknown: vec![],
         devices: vec![],
     };
     for (n, line) in text.lines().enumerate() {
@@ -199,7 +212,7 @@ fn parse(path: PathBuf, text: &str) -> io::Result<Config> {
             "public" => cfg.public = key32()?,
             "peer_key" => cfg.peer_key = Some(key32()?),
             "peer" => cfg.peer = Some(v.to_string()),
-            "peer_name" => cfg.peer_name = Some(v.to_string()),
+            "peer_name" => cfg.peer_name = Some(clean_name(v)).filter(|n| !n.is_empty()),
             "paused" | "effects" | "send" | "receive" | "fullscreen" | "swap_modifiers" | "gestures" | "wake" | "updates" | "corner" => {
                 let on = match v {
                     "yes" => true,
@@ -236,7 +249,8 @@ fn parse(path: PathBuf, text: &str) -> io::Result<Config> {
                     return Err(err(&format!("no group of keys called {bad}; there are {}", KEEP.join(", "))));
                 }
             }
-            "name" => cfg.name = Some(v.to_string()),
+            // Held to what the other computer and pairing accept, however it was typed in here.
+            "name" => cfg.name = Some(clean_name(v)).filter(|n| !n.is_empty()),
             "peer_mac" => cfg.peer_mac = Some(parse_mac(v).ok_or_else(|| err("expected a hardware address like aa:bb:cc:dd:ee:ff"))?),
             "restart" => cfg.restart = v.parse().map_err(|_| err("expected a number"))?,
             "device" => cfg
@@ -244,7 +258,7 @@ fn parse(path: PathBuf, text: &str) -> io::Result<Config> {
                 .push(Device::parse(v).ok_or_else(|| err("expected `device = key | name | address | last seen | hardware address`"))?),
             "theme" if ["system", "light", "dark"].contains(&v) => cfg.theme = v.to_string(),
             "theme" => return Err(err("expected system, light or dark")),
-            "port" => cfg.port = v.parse().map_err(|_| err("expected a port number"))?,
+            "port" => cfg.port = v.parse().ok().filter(|p| *p > 0).ok_or_else(|| err("expected a port number from 1 to 65535"))?,
             "edge" => {
                 cfg.layout.edge = match v {
                     "left" => Edge::Left,
@@ -268,9 +282,14 @@ fn parse(path: PathBuf, text: &str) -> io::Result<Config> {
             }
             "layout_at" => cfg.layout.stamp = v.parse().map_err(|_| err("expected milliseconds"))?,
             "resistance" => cfg.resistance = v.parse().ok().filter(|r| *r >= 0).ok_or_else(|| err("expected a number, 0 or more"))?,
-            "hotkey" => cfg.hotkey = u16::from_str_radix(v.trim_start_matches("0x"), 16).map_err(|_| err("expected a HID usage in hex"))?,
+            "hotkey" => {
+                cfg.hotkey = u16::from_str_radix(v.trim_start_matches("0x"), 16)
+                    .ok()
+                    .filter(|h| crate::keymap::evdev_from_hid(*h).is_some())
+                    .ok_or_else(|| err("expected the HID usage, in hex, of a key Yunta knows"))?
+            }
             // From a newer version, most likely: skipped, so going back a version still starts.
-            _ => log!("{}:{}: skipping `{k}`, which this version does not know", cfg.path.display(), n + 1),
+            _ => cfg.unknown.push(format!("{k} (line {})", n + 1)),
         }
     }
     // Paired before there was a list: the one paired is its first entry.
@@ -289,10 +308,28 @@ fn parse(path: PathBuf, text: &str) -> io::Result<Config> {
 /// Rewrites one setting in the file, keeping everything else. `Some` replaces the setting, or its
 /// commented-out example, or adds it at the end; `None` removes it.
 pub fn set(path: &Path, key: &str, value: Option<&str>) -> io::Result<()> {
-    rewrite(path, |text| {
+    update(path, |doc| {
+        doc.set(key, value);
+        Ok(())
+    })
+}
+
+/// yunta.conf being changed: what it says now, read under the lock, with the changes so far.
+pub struct Doc {
+    path: PathBuf,
+    text: String,
+}
+
+impl Doc {
+    /// The file as it stands, with the changes made so far.
+    pub fn config(&self) -> io::Result<Config> {
+        parse(self.path.clone(), &self.text)
+    }
+
+    pub fn set(&mut self, key: &str, value: Option<&str>) {
         let mut out = String::new();
         let mut written = value.is_none();
-        for line in text.lines() {
+        for line in self.text.lines() {
             let live = !line.trim_start().starts_with('#');
             let name = line.trim_start_matches(['#', ' ']).split('=').next().unwrap_or("").trim();
             if name == key && line.contains('=') && (live || !written) {
@@ -308,59 +345,93 @@ pub fn set(path: &Path, key: &str, value: Option<&str>) -> io::Result<()> {
         if !written && let Some(v) = value {
             out.push_str(&format!("{key} = {v}\n"));
         }
-        out
-    })
-}
+        self.text = out;
+    }
 
-/// Changes yunta.conf while the app and the settings window may both be at it: one at a time,
-/// under a lock beside it, and by writing a new file and swapping it in, so nobody ever reads
-/// half a file and saves that back, losing the rest.
-fn rewrite(path: &Path, change: impl FnOnce(&str) -> String) -> io::Result<()> {
-    let lock = OpenOptions::new().create(true).truncate(false).write(true).open(path.with_file_name("yunta.conf.lock"))?;
-    lock.lock()?;
-    let out = change(&fs::read_to_string(path)?);
-    let aside = path.with_extension("conf.new");
-    let mut file = OpenOptions::new();
-    file.write(true).create(true).truncate(true);
-    // Private like the file it replaces: it holds this machine's key.
-    #[cfg(unix)]
-    std::os::unix::fs::OpenOptionsExt::mode(&mut file, 0o600);
-    file.open(&aside)?.write_all(out.as_bytes())?;
-    fs::rename(&aside, path)
-}
-
-/// Writes the list of paired computers, in place of the one there.
-pub fn save_devices(path: &Path, devices: &[Device]) -> io::Result<()> {
-    rewrite(path, |text| {
+    /// Replaces the list of paired computers.
+    pub fn set_devices(&mut self, devices: &[Device]) {
         let mut out: String =
-            text.lines().filter(|l| l.split('=').next().unwrap_or("").trim() != "device").map(|l| format!("{l}\n")).collect();
+            self.text.lines().filter(|l| l.split('=').next().unwrap_or("").trim() != "device").map(|l| format!("{l}\n")).collect();
         for d in devices {
             out.push_str(&format!("device = {}\n", d.line()));
         }
-        out
-    })
+        self.text = out;
+    }
 }
 
-/// Adds `device` to the list, or updates its entry, and makes it the one in use.
-pub fn use_device(path: &Path, cfg: &Config, device: Device) -> io::Result<()> {
-    let mut devices: Vec<Device> = cfg.devices.iter().filter(|d| d.key != device.key).cloned().collect();
-    devices.insert(0, device.clone());
-    save_devices(path, &devices)?;
-    set(path, "peer_key", Some(&hex(&device.key)))?;
-    set(path, "peer", device.addr.as_deref())?;
-    set(path, "peer_name", Some(&device.name))?;
-    set(path, "peer_mac", device.mac.map(|m| mac_text(&m)).as_deref())
+/// Changes yunta.conf as one, however many settings `change` touches. The app and the settings
+/// window may both be at it, so it happens under a lock beside the file, from what the file says
+/// at that moment, and lands as one new file swapped in: nobody reads half of one, nor a pairing
+/// without its address, nor saves back a list someone else changed meanwhile.
+pub fn update(path: &Path, change: impl FnOnce(&mut Doc) -> io::Result<()>) -> io::Result<()> {
+    let lock = OpenOptions::new().create(true).truncate(false).write(true).open(path.with_file_name("yunta.conf.lock"))?;
+    lock.lock()?;
+    let mut doc = Doc { path: path.to_path_buf(), text: fs::read_to_string(path)? };
+    change(&mut doc)?;
+    replace(path, &doc.text)
+}
+
+/// Writes `text` as `path`: a new private file under a name of its own, flushed to disk, swapped
+/// in, and the swap itself flushed, so a power cut leaves the old file or the new, never a mix.
+fn replace(path: &Path, text: &str) -> io::Result<()> {
+    let mut tag = [0u8; 8];
+    getrandom::fill(&mut tag).map_err(|e| io::Error::other(e.to_string()))?;
+    let aside = path.with_extension(format!("conf.{}.new", hex(&tag)));
+    let mut options = OpenOptions::new();
+    options.write(true).create_new(true);
+    // Private like the file it replaces: it holds this machine's key.
+    #[cfg(unix)]
+    std::os::unix::fs::OpenOptionsExt::mode(&mut options, 0o600);
+    let written = options.open(&aside).and_then(|mut f| {
+        f.write_all(text.as_bytes())?;
+        f.sync_all()
+    });
+    if let Err(e) = written.and_then(|()| fs::rename(&aside, path)) {
+        let _ = fs::remove_file(&aside);
+        return Err(e);
+    }
+    #[cfg(unix)]
+    if let Some(dir) = path.parent() {
+        let _ = File::open(dir).and_then(|d| d.sync_all());
+    }
+    Ok(())
+}
+
+/// Makes `device` the computer in use, adding it to the list or refreshing its entry.
+pub fn use_device(path: &Path, device: Device) -> io::Result<()> {
+    update(path, |doc| {
+        let mut devices: Vec<Device> = doc.config()?.devices.into_iter().filter(|d| d.key != device.key).collect();
+        devices.insert(0, device.clone());
+        doc.set_devices(&devices);
+        doc.set("peer_key", Some(&hex(&device.key)));
+        doc.set("peer", device.addr.as_deref());
+        doc.set("peer_name", Some(&device.name));
+        doc.set("peer_mac", device.mac.map(|m| mac_text(&m)).as_deref());
+        Ok(())
+    })
 }
 
 /// Drops `key` from the list. If it was the one in use, this computer is no longer paired, and
 /// that computer can no longer connect.
-pub fn forget_device(path: &Path, cfg: &Config, key: &[u8]) -> io::Result<()> {
-    let devices: Vec<Device> = cfg.devices.iter().filter(|d| d.key != key).cloned().collect();
-    save_devices(path, &devices)?;
-    if cfg.peer_key.as_deref() == Some(key) {
-        for k in ["peer_key", "peer", "peer_name", "peer_mac"] {
-            set(path, k, None)?;
+pub fn forget_device(path: &Path, key: &[u8]) -> io::Result<()> {
+    update(path, |doc| {
+        let cfg = doc.config()?;
+        doc.set_devices(&cfg.devices.into_iter().filter(|d| d.key != key).collect::<Vec<_>>());
+        if cfg.peer_key.as_deref() == Some(key) {
+            for k in ["peer_key", "peer", "peer_name", "peer_mac"] {
+                doc.set(k, None);
+            }
         }
+        Ok(())
+    })
+}
+
+/// Changes the entry for `key` in the list of paired computers, if there is one.
+pub fn change_device(doc: &mut Doc, key: &[u8], change: impl FnOnce(&mut Device)) -> io::Result<()> {
+    let mut devices = doc.config()?.devices;
+    if let Some(d) = devices.iter_mut().find(|d| d.key == key) {
+        change(d);
+        doc.set_devices(&devices);
     }
     Ok(())
 }
@@ -390,10 +461,13 @@ pub fn lock(config: &Path, name: &str) -> io::Result<Option<File>> {
 /// Writes the arrangement into the file.
 pub fn save_layout(path: &Path, l: &Layout) -> io::Result<()> {
     let f = |v: u16| format!("{:.6}", f64::from(v) / 65535.0);
-    set(path, "edge", Some(l.edge.name()))?;
-    set(path, "along", Some(&format!("{}, {}, {}, {}", f(l.ours.0), f(l.ours.1), f(l.theirs.0), f(l.theirs.1))))?;
-    set(path, "corner", Some(if l.corner { "yes" } else { "no" }))?;
-    set(path, "layout_at", Some(&l.stamp.to_string()))
+    update(path, |doc| {
+        doc.set("edge", Some(l.edge.name()));
+        doc.set("along", Some(&format!("{}, {}, {}, {}", f(l.ours.0), f(l.ours.1), f(l.theirs.0), f(l.theirs.1))));
+        doc.set("corner", Some(if l.corner { "yes" } else { "no" }));
+        doc.set("layout_at", Some(&l.stamp.to_string()));
+        Ok(())
+    })
 }
 
 /// A name fit to save: no `#`, which starts a comment, no control characters, at most 48 long.
@@ -438,6 +512,9 @@ mod tests {
         assert_eq!((cfg.layout.edge, cfg.resistance, cfg.hotkey, cfg.port), (Edge::Left, 0, 0xE6, DEFAULT_PORT));
         assert_eq!((cfg.layout.ours, cfg.layout.theirs, cfg.layout.stamp), ((0, 32768), (0, 65535), 42));
         assert_eq!((cfg.paused, cfg.peer_name.as_deref()), (true, Some("the PC")));
+        let typo = parse("t".into(), &format!("{text}recieve = no\nname = \tPedro's | laptop\n")).unwrap();
+        assert_eq!((typo.unknown.len(), typo.receive, typo.name.as_deref()), (1, true, Some("Pedro's  laptop")));
+        assert!(typo.unknown[0].starts_with("recieve (line"));
         let more =
             format!("{text}trigger = hold\npointer_speed = 1.5\nkeep = volume, side_buttons\npeer_mac = AA-bb-cc-00-11-22\nsend = no\n");
         let cfg = parse("t".into(), &more).unwrap();
@@ -454,6 +531,8 @@ mod tests {
             "along = 1, 0, 0, 1",
             "along = 0, 2, 0, 1",
             "paused = maybe",
+            "port = 0",
+            "hotkey = 0xfe",
             "trigger = triple",
             "pointer_speed = 9",
             "keep = volume, everything",
@@ -475,14 +554,42 @@ mod tests {
         let cfg = load_from(&path).unwrap();
         assert_eq!((cfg.devices.len(), cfg.devices[0].name.as_str()), (1, "PC"));
         let laptop = Device { key: vec![0xEF; 32], name: "Laptop".into(), addr: None, seen: 5, mac: Some([1, 2, 3, 4, 5, 6]) };
-        use_device(&path, &cfg, laptop.clone()).unwrap();
+        use_device(&path, laptop.clone()).unwrap();
         let cfg = load_from(&path).unwrap();
         assert_eq!((cfg.devices.len(), cfg.peer_key.as_deref(), cfg.peer.as_deref()), (2, Some(&[0xEF; 32][..]), None));
         assert_eq!(cfg.devices[0], laptop);
-        forget_device(&path, &cfg, &[0xEF; 32]).unwrap();
+        forget_device(&path, &[0xEF; 32]).unwrap();
         let cfg = load_from(&path).unwrap();
         fs::remove_dir_all(&dir).unwrap();
         assert_eq!((cfg.devices.len(), cfg.peer_key.is_none(), cfg.devices[0].name.as_str()), (1, true, "PC"));
+    }
+
+    /// The window saving arrangements while the app notes each connection: nothing is lost,
+    /// and the file is whole after every change.
+    #[test]
+    fn changes_from_two_processes_all_land() {
+        let dir = std::env::temp_dir().join(format!("yunta-race-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("yunta.conf");
+        let k = "ab".repeat(32);
+        fs::write(&path, format!("key = {k}\npublic = {k}\npeer_key = {}\npeer_name = PC\n", "cd".repeat(32))).unwrap();
+        let window = {
+            let path = path.clone();
+            std::thread::spawn(move || {
+                for stamp in 1..=40 {
+                    save_layout(&path, &Layout { stamp, ..Layout::default() }).unwrap();
+                }
+            })
+        };
+        for seen in 1..=40 {
+            update(&path, |doc| change_device(doc, &[0xCD; 32], |d| d.seen = seen)).unwrap();
+            assert!(load_from(&path).is_ok(), "a half-written file was seen");
+        }
+        window.join().unwrap();
+        let cfg = load_from(&path).unwrap();
+        fs::remove_dir_all(&dir).unwrap();
+        assert_eq!((cfg.layout.stamp, cfg.devices.len(), cfg.devices[0].seen), (40, 1, 40));
+        assert_eq!(cfg.peer_key, Some(vec![0xCD; 32]));
     }
 
     #[test]
