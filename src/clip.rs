@@ -33,24 +33,33 @@ impl Clip {
     /// The clipboard as a message, unless it is what last crossed. Text wins over an image,
     /// because editors also offer a picture of copied text.
     pub fn take(&mut self) -> Option<Msg> {
-        let msg = match self.board.get_text() {
-            Ok(text) if !text.is_empty() && text.len() <= TEXT_MAX => Msg::ClipText(text),
-            _ => Msg::ClipPng(self.board.get_image().ok().and_then(|img| encode(&img)).filter(|png| png.len() <= PNG_MAX)?),
+        // Compared before an image is encoded: a big PNG takes long enough to delay the switch.
+        let (hash, msg): (u64, Box<dyn FnOnce() -> Option<Msg>>) = match self.board.get_text() {
+            Ok(text) if !text.is_empty() && text.len() <= TEXT_MAX => (text_hash(&text), Box::new(|| Some(Msg::ClipText(text)))),
+            _ => {
+                let img = self.board.get_image().ok()?;
+                (image_hash(&img), Box::new(move || encode(&img).filter(|png| png.len() <= PNG_MAX).map(Msg::ClipPng)))
+            }
         };
-        let hash = hash(&msg);
         if hash == self.last {
             return None;
         }
         self.last = hash;
-        Some(msg)
+        msg()
     }
 
     pub fn put(&mut self, msg: &Msg) {
-        self.last = hash(msg);
         let result = match msg {
-            Msg::ClipText(text) => self.board.set_text(text.as_str()),
+            Msg::ClipText(text) => {
+                self.last = text_hash(text);
+                self.board.set_text(text.as_str())
+            }
             Msg::ClipPng(png) => match decode(png) {
-                Some(img) => self.board.set_image(img),
+                // Remembered as the image itself, so reading it back here is not sent back.
+                Some(img) => {
+                    self.last = image_hash(&img);
+                    self.board.set_image(img)
+                }
                 None => return log!("clipboard: the peer sent an image that is not a PNG"),
             },
             _ => return,
@@ -61,9 +70,15 @@ impl Clip {
     }
 }
 
-fn hash(msg: &Msg) -> u64 {
+fn text_hash(text: &str) -> u64 {
     let mut h = DefaultHasher::new();
-    msg.encode().hash(&mut h);
+    ("text", text).hash(&mut h);
+    h.finish()
+}
+
+fn image_hash(img: &ImageData) -> u64 {
+    let mut h = DefaultHasher::new();
+    ("image", img.width, img.height, &img.bytes[..]).hash(&mut h);
     h.finish()
 }
 
