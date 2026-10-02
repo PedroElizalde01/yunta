@@ -27,6 +27,13 @@ fi
 cargo test --release
 ./package.sh
 key=${YUNTA_SIGNING_KEY:-$HOME/.config/yunta-release/signing.pem}
+# A release is for Linux and Windows both: one missing, and nothing goes out.
+for file in "dist/yunta_${version}_amd64.deb" dist/yunta.exe; do
+    if [ ! -f "$file" ]; then
+        echo "$file was not built (see package.sh for the tools it needs): not releasing." >&2
+        exit 1
+    fi
+done
 if [ ! -f dist/SHA256SUMS.sig ]; then
     echo "dist/ is not signed, so the app would refuse it as an update: not releasing." >&2
     exit 1
